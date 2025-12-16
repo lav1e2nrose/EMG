@@ -27,6 +27,9 @@ wheels/
 models/
 *.pkl
 
+# Predictions
+predictions/
+
 # Plots
 *.png
 *.jpg

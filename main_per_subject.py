@@ -1,5 +1,5 @@
 """
-Main entry point for EMG signal analysis pipeline.
+Main entry point for EMG signal analysis pipeline with per-subject learning.
 Orchestrates data loading, preprocessing, feature extraction, training, and evaluation.
 """
 import os
@@ -19,6 +19,7 @@ from preprocessing import (
 )
 from features import extract_features_from_windows, extract_segment_features
 from models import ActivityDetector, AmplitudeClassifier, FatigueClassifier
+from per_subject_learning import PerSubjectClassifier, extract_subject_features
 from utils import (
     parse_filename, get_train_files, load_segments_metadata,
     plot_confusion_matrix, print_classification_report
@@ -110,49 +111,24 @@ def train_activity_detector(train_dir, window_size=200, step_size=100,
     return detector
 
 
-def segment_signal_with_detector(signal, detector, window_size=200, step_size=100):
+def train_per_subject_classifiers(train_dir, model_type='random_forest', 
+                                  filter_amplitude_by_fatigue=False,
+                                  filter_fatigue_by_amplitude=False,
+                                  use_per_subject=True):
     """
-    Segment a signal using trained activity detector.
-    
-    Args:
-        signal: array-like, preprocessed signal
-        detector: ActivityDetector, trained detector
-        window_size: int, window size in samples
-        step_size: int, step size in samples
-    
-    Returns:
-        list: list of tuples (start, end) for detected segments
-    """
-    # Create sliding windows
-    windows, start_indices = create_sliding_windows(signal, window_size, step_size)
-    
-    # Extract features
-    features, _ = extract_features_from_windows(windows)
-    
-    # Predict activity
-    predictions = detector.predict(features)
-    
-    # Convert predictions to segments
-    segments = detect_activity_segments(predictions, start_indices)
-    
-    return segments
-
-
-def train_classifiers(train_dir, model_type='random_forest', 
-                     filter_amplitude_by_fatigue=False, filter_fatigue_by_amplitude=False):
-    """
-    Train amplitude and fatigue classifiers using segmented data.
+    Train amplitude and fatigue classifiers with per-subject learning.
     
     Args:
         train_dir: str, path to training directory
         model_type: str, 'random_forest' or 'xgboost'
-        filter_amplitude_by_fatigue: bool, if True, use only 'free' fatigue for amplitude training
-        filter_fatigue_by_amplitude: bool, if True, use only 'full' amplitude for fatigue training
+        filter_amplitude_by_fatigue: bool, if True, use only 'free' fatigue for amplitude
+        filter_fatigue_by_amplitude: bool, if True, use only 'full' amplitude for fatigue
+        use_per_subject: bool, if True, use per-subject learning
     
     Returns:
-        tuple: (AmplitudeClassifier, FatigueClassifier)
+        tuple: (classifier, classifier) for amplitude and fatigue
     """
-    print("\n=== Training Classifiers ===")
+    print("\n=== Training Classifiers with Per-Subject Learning ===")
     
     # Collect all segment data
     segments_data = []
@@ -183,7 +159,7 @@ def train_classifiers(train_dir, model_type='random_forest',
     print("\n--- Training Data Statistics ---")
     print(f"Total training actions (CSV files): {len(file_data['segment_dirs'])}")
     
-    # Count by amplitude
+    # Count by amplitude, fatigue, and subject
     amplitude_counts = {}
     fatigue_counts = {}
     subject_counts = {}
@@ -239,14 +215,24 @@ def train_classifiers(train_dir, model_type='random_forest',
     for cls, count in zip(unique_classes, class_counts):
         print(f"  {cls}: {count} samples")
     
-    X_amp_train, X_amp_test, y_amp_train, y_amp_test = train_test_split(
-        X_amp, y_amp, test_size=0.2, random_state=42, stratify=y_amp
+    # Split data
+    X_amp_train, X_amp_test, y_amp_train, y_amp_test, subj_amp_train, subj_amp_test = train_test_split(
+        X_amp, y_amp, subj_amp, test_size=0.2, random_state=42, stratify=y_amp
     )
     
-    amp_classifier = AmplitudeClassifier(model_type=model_type)
-    amp_classifier.fit(X_amp_train, y_amp_train)
+    if use_per_subject:
+        print("\nUsing per-subject learning for amplitude classification...")
+        amp_classifier = PerSubjectClassifier(model_type=model_type)
+        amp_classifier.fit(X_amp_train, y_amp_train, subj_amp_train)
+        
+        # Evaluate with per-subject predictions
+        y_amp_pred = amp_classifier.predict(X_amp_test, subj_amp_test)
+    else:
+        print("\nUsing standard learning for amplitude classification...")
+        amp_classifier = AmplitudeClassifier(model_type=model_type)
+        amp_classifier.fit(X_amp_train, y_amp_train)
+        y_amp_pred = amp_classifier.predict(X_amp_test)
     
-    y_amp_pred = amp_classifier.predict(X_amp_test)
     amp_accuracy = accuracy_score(y_amp_test, y_amp_pred)
     
     print(f"\nAmplitude Classifier Accuracy: {amp_accuracy:.4f}")
@@ -261,21 +247,17 @@ def train_classifiers(train_dir, model_type='random_forest',
     plot_confusion_matrix(
         y_amp_test, y_amp_pred,
         labels=amp_classifier.get_classes(),
-        title='Amplitude Classification Confusion Matrix',
-        save_path='amplitude_confusion_matrix.png'
+        title='Amplitude Classification Confusion Matrix (Per-Subject)' if use_per_subject else 'Amplitude Classification Confusion Matrix',
+        save_path='amplitude_confusion_matrix_ps.png' if use_per_subject else 'amplitude_confusion_matrix.png'
     )
     
-    # Prepare data for fatigue classification (only 'full' amplitude)
+    # Prepare data for fatigue classification
     X_fat = []
     y_fat = []
     subj_fat = []
     
     for seg in segments_data:
         if seg['amplitude'] == 'full' and seg['features'] is not None:
-            # Apply filtering if requested (already filtered by amplitude='full')
-            if filter_fatigue_by_amplitude and seg['amplitude'] != 'full':
-                continue
-            
             feature_values = list(seg['features'].values())
             X_fat.append(feature_values)
             y_fat.append(seg['fatigue'])
@@ -294,14 +276,24 @@ def train_classifiers(train_dir, model_type='random_forest',
     for cls, count in zip(unique_classes, class_counts):
         print(f"  {cls}: {count} samples")
     
-    X_fat_train, X_fat_test, y_fat_train, y_fat_test = train_test_split(
-        X_fat, y_fat, test_size=0.2, random_state=42, stratify=y_fat
+    # Split data
+    X_fat_train, X_fat_test, y_fat_train, y_fat_test, subj_fat_train, subj_fat_test = train_test_split(
+        X_fat, y_fat, subj_fat, test_size=0.2, random_state=42, stratify=y_fat
     )
     
-    fat_classifier = FatigueClassifier(model_type=model_type)
-    fat_classifier.fit(X_fat_train, y_fat_train)
+    if use_per_subject:
+        print("\nUsing per-subject learning for fatigue classification...")
+        fat_classifier = PerSubjectClassifier(model_type=model_type)
+        fat_classifier.fit(X_fat_train, y_fat_train, subj_fat_train)
+        
+        # Evaluate with per-subject predictions
+        y_fat_pred = fat_classifier.predict(X_fat_test, subj_fat_test)
+    else:
+        print("\nUsing standard learning for fatigue classification...")
+        fat_classifier = FatigueClassifier(model_type=model_type)
+        fat_classifier.fit(X_fat_train, y_fat_train)
+        y_fat_pred = fat_classifier.predict(X_fat_test)
     
-    y_fat_pred = fat_classifier.predict(X_fat_test)
     fat_accuracy = accuracy_score(y_fat_test, y_fat_pred)
     
     print(f"\nFatigue Classifier Accuracy: {fat_accuracy:.4f}")
@@ -316,8 +308,8 @@ def train_classifiers(train_dir, model_type='random_forest',
     plot_confusion_matrix(
         y_fat_test, y_fat_pred,
         labels=fat_classifier.get_classes(),
-        title='Fatigue Classification Confusion Matrix',
-        save_path='fatigue_confusion_matrix.png'
+        title='Fatigue Classification Confusion Matrix (Per-Subject)' if use_per_subject else 'Fatigue Classification Confusion Matrix',
+        save_path='fatigue_confusion_matrix_ps.png' if use_per_subject else 'fatigue_confusion_matrix.png'
     )
     
     return amp_classifier, fat_classifier
@@ -326,7 +318,7 @@ def train_classifiers(train_dir, model_type='random_forest',
 def main():
     """Main pipeline execution."""
     print("=" * 60)
-    print("EMG Signal Analysis Pipeline")
+    print("EMG Signal Analysis Pipeline with Per-Subject Learning")
     print("=" * 60)
     
     # Configuration
@@ -335,9 +327,12 @@ def main():
     STEP_SIZE = 100    # 0.05 seconds at 2000 Hz (50% overlap)
     MODEL_TYPE = 'random_forest'  # or 'xgboost'
     
-    # Filtering options for better accuracy
-    FILTER_AMPLITUDE_BY_FATIGUE = False  # Set to True to use only 'free' fatigue for amplitude
-    FILTER_FATIGUE_BY_AMPLITUDE = True   # Already enforced by using only 'full' amplitude
+    # Per-subject learning options
+    USE_PER_SUBJECT = True  # Enable per-subject learning for better accuracy
+    
+    # Filtering options
+    FILTER_AMPLITUDE_BY_FATIGUE = False  # Set to True to use only 'free' fatigue
+    FILTER_FATIGUE_BY_AMPLITUDE = True   # Already enforced (only 'full' amplitude)
     
     # Check if train directory exists
     if not os.path.exists(TRAIN_DIR):
@@ -357,29 +352,45 @@ def main():
     os.makedirs('models', exist_ok=True)
     activity_detector.save('models/activity_detector.pkl')
     
-    # Step 2: Train amplitude and fatigue classifiers
-    print("\nStep 2: Training Amplitude and Fatigue Classifiers...")
-    amp_classifier, fat_classifier = train_classifiers(
+    # Step 2: Train amplitude and fatigue classifiers with per-subject learning
+    print("\nStep 2: Training Classifiers with Per-Subject Learning...")
+    amp_classifier, fat_classifier = train_per_subject_classifiers(
         TRAIN_DIR,
         model_type=MODEL_TYPE,
         filter_amplitude_by_fatigue=FILTER_AMPLITUDE_BY_FATIGUE,
-        filter_fatigue_by_amplitude=FILTER_FATIGUE_BY_AMPLITUDE
+        filter_fatigue_by_amplitude=FILTER_FATIGUE_BY_AMPLITUDE,
+        use_per_subject=USE_PER_SUBJECT
     )
     
     # Save classifiers
-    amp_classifier.save('models/amplitude_classifier.pkl')
-    fat_classifier.save('models/fatigue_classifier.pkl')
+    if USE_PER_SUBJECT:
+        amp_classifier.save('models/amplitude_classifier_ps.pkl')
+        fat_classifier.save('models/fatigue_classifier_ps.pkl')
+        print("\nPer-subject models saved:")
+        print("  - amplitude_classifier_ps.pkl")
+        print("  - fatigue_classifier_ps.pkl")
+    else:
+        amp_classifier.save('models/amplitude_classifier.pkl')
+        fat_classifier.save('models/fatigue_classifier.pkl')
     
     print("\n" + "=" * 60)
     print("Pipeline completed successfully!")
     print("=" * 60)
     print("\nModels saved to 'models/' directory:")
     print("  - activity_detector.pkl")
-    print("  - amplitude_classifier.pkl")
-    print("  - fatigue_classifier.pkl")
+    if USE_PER_SUBJECT:
+        print("  - amplitude_classifier_ps.pkl (per-subject)")
+        print("  - fatigue_classifier_ps.pkl (per-subject)")
+    else:
+        print("  - amplitude_classifier.pkl")
+        print("  - fatigue_classifier.pkl")
     print("\nConfusion matrices saved:")
-    print("  - amplitude_confusion_matrix.png")
-    print("  - fatigue_confusion_matrix.png")
+    if USE_PER_SUBJECT:
+        print("  - amplitude_confusion_matrix_ps.png")
+        print("  - fatigue_confusion_matrix_ps.png")
+    else:
+        print("  - amplitude_confusion_matrix.png")
+        print("  - fatigue_confusion_matrix.png")
 
 
 if __name__ == '__main__':

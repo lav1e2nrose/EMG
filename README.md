@@ -16,7 +16,10 @@ A complete machine learning pipeline for EMG (Electromyography) signal analysis 
   - Time-Frequency: Discrete Wavelet Transform (DWT) and Wavelet Packet Decomposition (WPD) energy ratios
   - Autoregressive (AR) coefficients
 - **Multi-class Classification**: Separate models for amplitude and fatigue detection
-- **Visualization**: Confusion matrices and classification reports
+- **Per-Subject Learning**: Subject-specific model training for improved accuracy
+- **Test Set Prediction**: Comprehensive prediction with detailed visualization
+- **Detailed Training Statistics**: Sample counts per class, subject distribution
+- **Visualization**: Confusion matrices, signal segmentation plots, feature heatmaps
 
 ## Project Structure
 
@@ -25,12 +28,17 @@ EMG/
 ├── train/                          # Training data
 │   ├── *.csv                       # Raw EMG signals
 │   └── *_segments/                 # Manual segmentation examples
+├── test/                           # Test data (optional)
+│   └── *.csv                       # Test EMG signals
 ├── src/
 │   ├── preprocessing.py            # Signal filtering and segmentation
 │   ├── features.py                 # Advanced feature extraction
 │   ├── models.py                   # ML model wrappers
+│   ├── per_subject_learning.py    # Per-subject learning module
 │   └── utils.py                    # Utilities and visualization
 ├── main.py                         # Main pipeline entry point
+├── main_per_subject.py             # Pipeline with per-subject learning
+├── predict_test_set.py             # Test set prediction with visualization
 ├── requirements.txt                # Python dependencies
 └── README.md                       # This file
 ```
@@ -67,11 +75,46 @@ pip install -r requirements.txt
 
 ## Usage
 
-### Run the Complete Pipeline
+### Run the Complete Pipeline (Standard)
 
 ```bash
 python main.py
 ```
+
+This will:
+1. Train an activity detector using sliding window features
+2. Train amplitude and fatigue classifiers using manual segments
+3. Output detailed training statistics (samples per class, subject distribution)
+4. Save trained models to `models/` directory
+5. Generate confusion matrices as PNG files
+
+### Run the Pipeline with Per-Subject Learning
+
+```bash
+python main_per_subject.py
+```
+
+This enhanced version:
+1. Trains separate models for each subject to learn individual patterns
+2. Combines per-subject and global models for better accuracy
+3. Especially improves fatigue classification (different people have different fatigue patterns)
+4. Outputs per-subject model statistics
+
+### Test Set Prediction with Visualization
+
+```bash
+python predict_test_set.py
+```
+
+This will:
+1. Load trained models from `models/` directory
+2. Segment and classify signals from `test/` directory (or uses training data if no test directory)
+3. Generate comprehensive visualizations for each signal:
+   - Full signal with segmentation boundaries
+   - Amplitude and fatigue predictions per segment
+   - Feature heatmap showing characteristics of each segment
+4. Save all visualizations to `predictions/` directory
+5. Output prediction summary statistics
 
 ### Run Unit Tests
 
@@ -79,25 +122,26 @@ python main.py
 python -m unittest tests/test_pipeline.py
 ```
 
-This will:
-1. Train an activity detector using sliding window features
-2. Train amplitude and fatigue classifiers using manual segments
-3. Save trained models to `models/` directory
-4. Generate confusion matrices as PNG files
-
 ### Pipeline Configuration
 
-Edit parameters in `main.py`:
+Edit parameters in `main.py` or `main_per_subject.py`:
 
 ```python
 WINDOW_SIZE = 200    # Window size (0.1s at 2000 Hz)
 STEP_SIZE = 100      # Step size (0.05s, 50% overlap)
 MODEL_TYPE = 'random_forest'  # or 'xgboost'
+
+# Per-subject learning options (main_per_subject.py only)
+USE_PER_SUBJECT = True  # Enable per-subject learning
+
+# Filtering options for better accuracy
+FILTER_AMPLITUDE_BY_FATIGUE = False  # Use only 'free' fatigue for amplitude training
+FILTER_FATIGUE_BY_AMPLITUDE = True   # Use only 'full' amplitude for fatigue training
 ```
 
 ### Output
 
-The pipeline generates:
+The standard pipeline (`main.py`) generates:
 - **models/**
   - `activity_detector.pkl`: Binary classifier for segment detection
   - `amplitude_classifier.pkl`: Multi-class classifier for amplitude
@@ -105,6 +149,19 @@ The pipeline generates:
 - **Confusion Matrices**
   - `amplitude_confusion_matrix.png`
   - `fatigue_confusion_matrix.png`
+
+The per-subject pipeline (`main_per_subject.py`) additionally generates:
+- **models/**
+  - `amplitude_classifier_ps.pkl`: Per-subject amplitude classifier
+  - `fatigue_classifier_ps.pkl`: Per-subject fatigue classifier
+- **Confusion Matrices**
+  - `amplitude_confusion_matrix_ps.png`
+  - `fatigue_confusion_matrix_ps.png`
+
+The test prediction script (`predict_test_set.py`) generates:
+- **predictions/**
+  - `[filename]_segmentation.png`: Full signal with detected segments and predictions
+  - `[filename]_features.png`: Feature heatmap for all segments
 
 ## Technical Approach
 
@@ -153,11 +210,44 @@ Example results from training:
 - **Amplitude Classifier**: ~91% accuracy (3-class)
 - **Fatigue Classifier**: ~41% accuracy (4-class, challenging problem)
 
-Note: Fatigue detection is inherently difficult due to subtle signal changes and limited training data. Performance may improve with more data and hyperparameter tuning.
+### Training Statistics
+
+The enhanced pipeline now outputs detailed statistics during training:
+
+```
+--- Training Data Statistics ---
+Total training actions (CSV files): 31
+
+Amplitude Distribution:
+  full: 141 samples
+  half: 33 samples
+  invalid: 42 samples
+
+Fatigue Distribution:
+  free: 115 samples
+  heavy: 30 samples
+  light: 35 samples
+  medium: 36 samples
+
+Subject Distribution:
+  Subject 1: 98 samples
+  Subject 2: 46 samples
+  Subject 3: 72 samples
+```
+
+### Per-Subject Learning Benefits
+
+When using `main_per_subject.py`:
+- Each subject gets a personalized model that learns their specific patterns
+- Falls back to global model for unseen subjects
+- Particularly beneficial for fatigue detection where individual patterns vary significantly
+- The system trains 1 global model + N subject-specific models (where N = number of subjects with sufficient data)
+
+Note: Fatigue detection is inherently difficult due to subtle signal changes and limited training data. Per-subject learning helps by accounting for individual variations in fatigue patterns.
 
 ## Extending the Pipeline
 
-### Use Trained Models
+### Use Trained Models for Prediction
 
 ```python
 from src.models import ActivityDetector, AmplitudeClassifier, FatigueClassifier
@@ -171,13 +261,46 @@ detector.load('models/activity_detector.pkl')
 amp_clf = AmplitudeClassifier()
 amp_clf.load('models/amplitude_classifier.pkl')
 
+fat_clf = FatigueClassifier()
+fat_clf.load('models/fatigue_classifier.pkl')
+
 # Process new signal
 signal = load_emg_data('new_data.csv')
 filtered = preprocess_signal(signal)
 
 # Segment and classify
-# ... (see main.py for complete example)
+# ... (see main.py or predict_test_set.py for complete example)
 ```
+
+### Use Per-Subject Models
+
+```python
+from src.per_subject_learning import PerSubjectClassifier
+
+# Load per-subject model
+amp_clf_ps = PerSubjectClassifier()
+amp_clf_ps.load('models/amplitude_classifier_ps.pkl')
+
+# Predict with subject ID for personalized prediction
+predictions = amp_clf_ps.predict(features, subject_ids=['1', '2', '1'])
+
+# Or predict without subject ID (uses global model)
+predictions = amp_clf_ps.predict(features)
+```
+
+### Visualize Test Results
+
+The `predict_test_set.py` script provides comprehensive visualization:
+
+1. **Signal Segmentation Plot**: Shows the complete signal with:
+   - Detected segment boundaries
+   - Color-coded amplitude predictions per segment
+   - Timeline view with amplitude and fatigue predictions
+
+2. **Feature Heatmap**: Displays normalized features for each segment:
+   - Key time-domain features (RMS, MAV, ZC, SSC, WL, VAR)
+   - Frequency-domain features (Mean/Median frequency)
+   - Easy comparison across segments
 
 ### Add Custom Features
 

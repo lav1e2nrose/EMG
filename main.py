@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 from preprocessing import (
     load_emg_data, preprocess_signal, create_sliding_windows,
-    label_windows_from_segments, get_segment_ranges_from_files,
+    label_windows_from_segments, improved_get_segment_ranges,
     detect_activity_segments
 )
 from features import extract_features_from_windows, extract_segment_features
@@ -56,7 +56,7 @@ def train_activity_detector(train_dir, window_size=200, step_size=100,
         filtered_signal = preprocess_signal(raw_signal)
         
         # Get segment ranges
-        segment_ranges = get_segment_ranges_from_files(raw_file, segment_dir)
+        segment_ranges = improved_get_segment_ranges(raw_file, segment_dir)
         
         if len(segment_ranges) == 0:
             print(f"  Warning: No segments found for {raw_file}")
@@ -96,7 +96,7 @@ def train_activity_detector(train_dir, window_size=200, step_size=100,
     
     # Train model
     print(f"\nTraining {model_type} model...")
-    detector = ActivityDetector(model_type=model_type)
+    detector = ActivityDetector(model_type=model_type, decision_threshold=0.6)
     detector.fit(X_train, y_train)
     
     # Evaluate

@@ -125,7 +125,8 @@ def compute_rms(window):
     return np.sqrt(np.mean(window ** 2))
 
 
-def label_windows_from_segments(signal_length, segment_ranges, window_size, step_size):
+def label_windows_from_segments(signal_length, segment_ranges, window_size, step_size,
+                                overlap_threshold=0.1):
     """
     Create binary labels for sliding windows based on manual segmentation.
     Label is 1 if window overlaps with any segment, 0 otherwise.
@@ -135,6 +136,8 @@ def label_windows_from_segments(signal_length, segment_ranges, window_size, step
         segment_ranges: list of tuples (start, end) for active segments
         window_size: int, size of each window in samples
         step_size: int, step size between windows in samples
+        overlap_threshold: float, minimum fraction of window that must overlap
+                          with a segment to be considered active
     
     Returns:
         np.array: binary labels for each window (1=active, 0=inactive)
@@ -143,17 +146,20 @@ def label_windows_from_segments(signal_length, segment_ranges, window_size, step
     labels = []
     start_indices = []
     
+    min_overlap = max(1, int(window_size * overlap_threshold))
+    
     for start in range(0, signal_length - window_size + 1, step_size):
         end = start + window_size
         start_indices.append(start)
         
         # Check if window overlaps with any segment
         is_active = False
-        window_center = (start + end) // 2
         
         for seg_start, seg_end in segment_ranges:
-            # Consider window active if its center is within a segment
-            if seg_start <= window_center <= seg_end:
+            overlap = min(end, seg_end) - max(start, seg_start)
+            
+            # Consider window active if sufficient overlap with any segment
+            if overlap >= min_overlap:
                 is_active = True
                 break
         

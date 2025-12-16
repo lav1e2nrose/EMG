@@ -73,6 +73,21 @@ class TestPreprocessing(unittest.TestCase):
         self.assertEqual(len(labels), len(indices))
         self.assertTrue(all(l in [0, 1] for l in labels))
     
+    def test_label_windows_overlap_threshold(self):
+        """Ensure partial overlap still marks window as active."""
+        signal_length = 400
+        # Very short segment that would be missed by center-only logic
+        segment_ranges = [(95, 105)]
+        window_size = 100
+        step_size = 50
+        
+        labels, _ = label_windows_from_segments(
+            signal_length, segment_ranges, window_size, step_size, overlap_threshold=0.05
+        )
+        
+        # The window starting at 50 overlaps 55 samples with the segment
+        self.assertEqual(labels[1], 1)
+    
     def test_detect_activity_segments(self):
         """Test segment detection from predictions."""
         predictions = np.array([0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0])

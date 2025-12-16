@@ -13,11 +13,82 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 from preprocessing import (
     load_emg_data, preprocess_signal, create_sliding_windows,
-    detect_activity_segments
+    detect_activity_segments, create_sequence_windows_for_segmentation,
+    decode_three_state_predictions
 )
 from features import extract_features_from_windows, extract_segment_features
-from models import ActivityDetector, AmplitudeClassifier, FatigueClassifier
+from models import ActivityDetector, AmplitudeClassifier, FatigueClassifier, CRNNActivitySegmenter
 from utils import parse_filename
+
+
+def segment_signal_with_crnn(signal, segmenter):
+    """
+    Predict three-state labels and convert to segments using CRNN segmenter.
+    
+    Args:
+        signal: array-like, preprocessed EMG signal
+        segmenter: CRNNActivitySegmenter, trained segmenter
+    
+    Returns:
+        list: list of tuples (start, end) for detected segments
+    """
+    seq_len = segmenter.sequence_length
+    step = segmenter.step_size
+
+    # Pad the tail so that the final window is complete
+    signal_length = len(signal)
+    if signal_length < seq_len:
+        pad_length = seq_len - signal_length
+    else:
+        remainder = (signal_length - seq_len) % step
+        pad_length = 0 if remainder == 0 else step - remainder
+
+    if pad_length > 0:
+        signal = np.pad(signal, (0, pad_length), mode="edge")
+
+    dummy_labels = np.zeros(len(signal), dtype=int)
+    windows, _ = create_sequence_windows_for_segmentation(signal, dummy_labels, seq_len, step)
+    preds = segmenter.predict(windows)
+    # Reconstruct per-sample predictions by overlap-averaging (simple majority)
+    per_sample = np.zeros(len(signal), dtype=int)
+    counts = np.zeros(len(signal), dtype=int)
+    for i, start in enumerate(range(0, len(signal) - seq_len + 1, step)):
+        per_sample[start:start + seq_len] += preds[i]
+        counts[start:start + seq_len] += 1
+    # Prevent division by zero for samples at signal boundaries not covered by windows
+    counts[counts == 0] = 1
+    per_sample = (per_sample / counts).round().astype(int)
+    per_sample = np.clip(per_sample, 0, 2)
+    return decode_three_state_predictions(per_sample)
+
+
+def segment_signal_with_detector(signal, detector, window_size=200, step_size=100):
+    """
+    Segment signal using ActivityDetector (sliding window classifier).
+    
+    Args:
+        signal: array-like, preprocessed EMG signal
+        detector: ActivityDetector, trained detector
+        window_size: int, window size in samples
+        step_size: int, step size in samples
+    
+    Returns:
+        list: list of tuples (start, end) for detected segments
+    """
+    # Create sliding windows
+    windows, start_indices = create_sliding_windows(signal, window_size, step_size)
+    
+    # Extract features
+    features, _ = extract_features_from_windows(windows)
+    
+    # Predict activity
+    predictions = detector.predict(features)
+    
+    # Convert predictions to segments with lower min_length for better detection
+    # min_length=200 means 0.1s minimum segment, merge_gap=500 means 0.25s gap allowed
+    segments = detect_activity_segments(predictions, start_indices, min_length=200, merge_gap=500)
+    
+    return segments
 
 
 def plot_signal_with_predictions(signal, segments, predictions, sampling_rate=2000,
@@ -154,17 +225,17 @@ def plot_segment_features_heatmap(segments_features, predictions, save_path=None
 
 
 def predict_test_file(signal_path, detector, amp_clf, fat_clf,
-                      window_size=200, step_size=100):
+                      segmenter=None, use_crnn=False):
     """
     Predict amplitude and fatigue for a single test file.
     
     Args:
         signal_path: str, path to test signal CSV
-        detector: ActivityDetector, trained activity detector
+        detector: ActivityDetector, trained activity detector (used if use_crnn=False)
         amp_clf: AmplitudeClassifier, trained amplitude classifier
         fat_clf: FatigueClassifier, trained fatigue classifier
-        window_size: int, window size in samples
-        step_size: int, step size in samples
+        segmenter: CRNNActivitySegmenter, trained CRNN segmenter (used if use_crnn=True)
+        use_crnn: bool, if True use CRNN segmenter, else use ActivityDetector
     
     Returns:
         tuple: (segments, predictions, segments_features, filtered_signal)
@@ -176,19 +247,11 @@ def predict_test_file(signal_path, detector, amp_clf, fat_clf,
     filtered_signal = preprocess_signal(raw_signal)
     print(f"Signal length: {len(filtered_signal)} samples ({len(filtered_signal)/2000:.2f} seconds)")
     
-    # Create sliding windows for activity detection
-    windows, start_indices = create_sliding_windows(filtered_signal, window_size, step_size)
-    
-    # Extract features
-    features, _ = extract_features_from_windows(windows)
-    
-    # Predict activity
-    predictions = detector.predict(features)
-    active_windows = np.sum(predictions)
-    print(f"Active windows: {active_windows}/{len(predictions)} ({100*active_windows/len(predictions):.1f}%)")
-    
-    # Convert predictions to segments
-    segments = detect_activity_segments(predictions, start_indices)
+    # Detect segments using selected method
+    if use_crnn and segmenter is not None:
+        segments = segment_signal_with_crnn(filtered_signal, segmenter)
+    else:
+        segments = segment_signal_with_detector(filtered_signal, detector)
     print(f"Detected segments: {len(segments)}")
     
     # Classify each segment
@@ -241,15 +304,29 @@ def main():
     print("EMG Test Set Prediction with Visualization")
     print("=" * 80)
     
-    # Check if models exist
-    if not os.path.exists('models/activity_detector.pkl'):
+    # Check if models exist - prefer ActivityDetector, fall back to CRNN
+    use_crnn = False
+    if os.path.exists('models/activity_detector.pkl'):
+        print("\nUsing ActivityDetector for segmentation...")
+    elif os.path.exists('models/crnn_activity_segmenter.pt'):
+        print("\nUsing CRNN Segmenter for segmentation...")
+        use_crnn = True
+    else:
         print("Error: Models not found. Please run 'python main.py' first to train models.")
         return
     
     # Load models
     print("\nLoading trained models...")
-    detector = ActivityDetector()
-    detector.load('models/activity_detector.pkl')
+    
+    detector = None
+    segmenter = None
+    
+    if use_crnn:
+        segmenter = CRNNActivitySegmenter()
+        segmenter.load('models/crnn_activity_segmenter.pt')
+    else:
+        detector = ActivityDetector()
+        detector.load('models/activity_detector.pkl')
     
     amp_clf = AmplitudeClassifier()
     amp_clf.load('models/amplitude_classifier.pkl')
@@ -286,7 +363,8 @@ def main():
         try:
             # Predict
             segments, predictions, segments_features, filtered_signal = predict_test_file(
-                test_file, detector, amp_clf, fat_clf
+                test_file, detector, amp_clf, fat_clf,
+                segmenter=segmenter, use_crnn=use_crnn
             )
             
             # Store results

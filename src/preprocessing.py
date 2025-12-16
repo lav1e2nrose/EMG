@@ -21,8 +21,33 @@ def load_emg_data(filepath):
     Returns:
         np.array: EMG signal data (1D array)
     """
+    # Try reading without header first
     data = pd.read_csv(filepath, header=None)
-    return data.values.flatten()
+    
+    # Check if first row is a header by trying to convert to float
+    first_val = data.iloc[0, 0]
+    is_header = False
+    if isinstance(first_val, str):
+        try:
+            float(first_val)
+        except ValueError:
+            # First value is a non-numeric string, so this is likely a header
+            is_header = True
+    
+    if is_header:
+        # File has a header, reload with header
+        data = pd.read_csv(filepath)
+        # Use second column if available (typically amplitude data), otherwise first
+        if data.shape[1] > 1:
+            return data.iloc[:, 1].values.astype(float).flatten()
+        else:
+            return data.iloc[:, 0].values.astype(float).flatten()
+    
+    # If multi-column, use second column (typically amplitude data)
+    if data.shape[1] > 1:
+        return data.iloc[:, 1].values.astype(float).flatten()
+    
+    return data.values.astype(float).flatten()
 
 
 def bandpass_filter(data, lowcut=20, highcut=450, fs=2000, order=4):
@@ -294,7 +319,7 @@ def get_segment_ranges_from_files(raw_filepath, segment_dir):
 
 
 def find_segment_in_raw_signal(raw_signal, segment_signal, search_window=10000,
-                               min_correlation=0.9):
+                               min_correlation=0.7):
     """
     Find where a segment appears in the raw signal using correlation.
     

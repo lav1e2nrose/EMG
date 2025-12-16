@@ -159,10 +159,16 @@ def segment_signal_with_crnn(signal, segmenter):
     seq_len = segmenter.sequence_length
     step = segmenter.step_size
 
-    # Pad tail if needed
-    pad_length = (-(len(signal) - seq_len)) % step
-    if pad_length:
-        signal = np.pad(signal, (0, pad_length), mode='edge')
+    # Pad the tail so that the final window is complete
+    signal_length = len(signal)
+    if signal_length < seq_len:
+        pad_length = seq_len - signal_length
+    else:
+        remainder = (signal_length - seq_len) % step
+        pad_length = 0 if remainder == 0 else step - remainder
+
+    if pad_length > 0:
+        signal = np.pad(signal, (0, pad_length), mode="edge")
 
     dummy_labels = np.zeros(len(signal), dtype=int)
     windows, _ = create_sequence_windows_for_segmentation(signal, dummy_labels, seq_len, step)
@@ -175,6 +181,7 @@ def segment_signal_with_crnn(signal, segmenter):
         counts[start:start + seq_len] += 1
     counts[counts == 0] = 1
     per_sample = (per_sample / counts).round().astype(int)
+    per_sample = np.clip(per_sample, 0, 2)
     return decode_three_state_predictions(per_sample)
 
 
@@ -440,7 +447,7 @@ def main():
     print("Pipeline completed successfully!")
     print("=" * 60)
     print("\nModels saved to 'models/' directory:")
-    print("  - activity_detector.pkl")
+    print("  - crnn_activity_segmenter.pt")
     print("  - amplitude_classifier.pkl")
     print("  - fatigue_classifier.pkl")
     print("\nConfusion matrices saved:")

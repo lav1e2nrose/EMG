@@ -7,6 +7,9 @@ import pandas as pd
 from scipy import signal
 from scipy.signal import butter, filtfilt, iirnotch
 
+THREE_STATE_RATIO_MIN = 0.1
+THREE_STATE_RATIO_MAX = 0.9
+
 
 def load_emg_data(filepath):
     """
@@ -181,7 +184,7 @@ def label_signal_three_state(signal_length, segment_ranges, concentric_ratio=0.6
     Each manual segment is split into two phases based on concentric_ratio.
     """
     labels = np.zeros(signal_length, dtype=int)
-    ratio = np.clip(concentric_ratio, 0.1, 0.9)
+    ratio = np.clip(concentric_ratio, THREE_STATE_RATIO_MIN, THREE_STATE_RATIO_MAX)
 
     for seg_start, seg_end in segment_ranges:
         seg_start = max(0, int(seg_start))

@@ -124,7 +124,7 @@ class TestPreprocessing(unittest.TestCase):
 
         self.assertEqual(windows.shape, lbl.shape)
         self.assertEqual(windows.shape[1], 10)
-        self.assertTrue(np.array_equal(lbl[1, 0:5], labels[5:10]))
+        self.assertTrue(np.array_equal(lbl[1], labels[5:15]))
 
 
 class TestFeatures(unittest.TestCase):

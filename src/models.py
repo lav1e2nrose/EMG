@@ -370,11 +370,26 @@ class CRNNActivitySegmenter:
     Time-series semantic segmenter producing 0/1/2 labels per timestep.
     """
 
-    def __init__(self, sequence_length=400, step_size=200, device=None):
+    def __init__(
+        self,
+        sequence_length=400,
+        step_size=200,
+        conv_channels=32,
+        lstm_hidden=64,
+        num_classes=3,
+        device=None,
+    ):
         self.sequence_length = sequence_length
         self.step_size = step_size
+        self.conv_channels = conv_channels
+        self.lstm_hidden = lstm_hidden
+        self.num_classes = num_classes
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = _CRNNBackbone().to(self.device)
+        self.model = _CRNNBackbone(
+            conv_channels=self.conv_channels,
+            lstm_hidden=self.lstm_hidden,
+            num_classes=self.num_classes,
+        ).to(self.device)
 
     def fit(self, windows, labels, epochs=3, batch_size=32, lr=1e-3):
         """
@@ -419,6 +434,9 @@ class CRNNActivitySegmenter:
                 "model_state_dict": self.model.state_dict(),
                 "sequence_length": self.sequence_length,
                 "step_size": self.step_size,
+                "conv_channels": self.conv_channels,
+                "lstm_hidden": self.lstm_hidden,
+                "num_classes": self.num_classes,
             },
             filepath,
         )
@@ -427,5 +445,12 @@ class CRNNActivitySegmenter:
         checkpoint = torch.load(filepath, map_location=self.device)
         self.sequence_length = checkpoint.get("sequence_length", self.sequence_length)
         self.step_size = checkpoint.get("step_size", self.step_size)
-        self.model = _CRNNBackbone().to(self.device)
+        self.conv_channels = checkpoint.get("conv_channels", self.conv_channels)
+        self.lstm_hidden = checkpoint.get("lstm_hidden", self.lstm_hidden)
+        self.num_classes = checkpoint.get("num_classes", self.num_classes)
+        self.model = _CRNNBackbone(
+            conv_channels=self.conv_channels,
+            lstm_hidden=self.lstm_hidden,
+            num_classes=self.num_classes,
+        ).to(self.device)
         self.model.load_state_dict(checkpoint["model_state_dict"])

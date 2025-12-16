@@ -24,9 +24,17 @@ def load_emg_data(filepath):
     # Try reading without header first
     data = pd.read_csv(filepath, header=None)
     
-    # Check if first row is a header (contains strings)
+    # Check if first row is a header by trying to convert to float
     first_val = data.iloc[0, 0]
+    is_header = False
     if isinstance(first_val, str):
+        try:
+            float(first_val)
+        except ValueError:
+            # First value is a non-numeric string, so this is likely a header
+            is_header = True
+    
+    if is_header:
         # File has a header, reload with header
         data = pd.read_csv(filepath)
         # Use second column if available (typically amplitude data), otherwise first

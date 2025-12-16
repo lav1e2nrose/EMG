@@ -55,6 +55,7 @@ def segment_signal_with_crnn(signal, segmenter):
     for i, start in enumerate(range(0, len(signal) - seq_len + 1, step)):
         per_sample[start:start + seq_len] += preds[i]
         counts[start:start + seq_len] += 1
+    # Prevent division by zero for samples at signal boundaries not covered by windows
     counts[counts == 0] = 1
     per_sample = (per_sample / counts).round().astype(int)
     per_sample = np.clip(per_sample, 0, 2)

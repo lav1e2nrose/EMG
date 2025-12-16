@@ -138,13 +138,16 @@ def segment_signal_with_detector(signal, detector, window_size=200, step_size=10
     return segments
 
 
-def train_classifiers(train_dir, model_type='random_forest'):
+def train_classifiers(train_dir, model_type='random_forest', 
+                     filter_amplitude_by_fatigue=False, filter_fatigue_by_amplitude=False):
     """
     Train amplitude and fatigue classifiers using segmented data.
     
     Args:
         train_dir: str, path to training directory
         model_type: str, 'random_forest' or 'xgboost'
+        filter_amplitude_by_fatigue: bool, if True, use only 'free' fatigue for amplitude training
+        filter_fatigue_by_amplitude: bool, if True, use only 'full' amplitude for fatigue training
     
     Returns:
         tuple: (AmplitudeClassifier, FatigueClassifier)
@@ -156,6 +159,7 @@ def train_classifiers(train_dir, model_type='random_forest'):
     
     file_data = get_train_files(train_dir)
     
+    print("\n--- Loading Segment Data ---")
     for raw_file, segment_dir in file_data['segment_dirs'].items():
         print(f"Loading segments from {os.path.basename(segment_dir)}...")
         
@@ -175,22 +179,65 @@ def train_classifiers(train_dir, model_type='random_forest'):
     
     print(f"\nTotal segments loaded: {len(segments_data)}")
     
+    # Print detailed statistics
+    print("\n--- Training Data Statistics ---")
+    print(f"Total training actions (CSV files): {len(file_data['segment_dirs'])}")
+    
+    # Count by amplitude
+    amplitude_counts = {}
+    fatigue_counts = {}
+    subject_counts = {}
+    
+    for seg in segments_data:
+        amp = seg['amplitude']
+        fat = seg['fatigue']
+        subj = seg['subject_id']
+        
+        amplitude_counts[amp] = amplitude_counts.get(amp, 0) + 1
+        fatigue_counts[fat] = fatigue_counts.get(fat, 0) + 1
+        subject_counts[subj] = subject_counts.get(subj, 0) + 1
+    
+    print("\nAmplitude Distribution:")
+    for amp in sorted(amplitude_counts.keys()):
+        print(f"  {amp}: {amplitude_counts[amp]} samples")
+    
+    print("\nFatigue Distribution:")
+    for fat in sorted(fatigue_counts.keys()):
+        print(f"  {fat}: {fatigue_counts[fat]} samples")
+    
+    print("\nSubject Distribution:")
+    for subj in sorted(subject_counts.keys()):
+        print(f"  Subject {subj}: {subject_counts[subj]} samples")
+    
     # Prepare data for amplitude classification
     X_amp = []
     y_amp = []
+    subj_amp = []
     
     for seg in segments_data:
         if seg['features'] is not None:
+            # Apply filtering if requested
+            if filter_amplitude_by_fatigue and seg['fatigue'] != 'free':
+                continue
+            
             feature_values = list(seg['features'].values())
             X_amp.append(feature_values)
             y_amp.append(seg['amplitude'])
+            subj_amp.append(seg['subject_id'])
     
     X_amp = np.array(X_amp)
     y_amp = np.array(y_amp)
+    subj_amp = np.array(subj_amp)
     
     # Train amplitude classifier
     print("\n--- Training Amplitude Classifier ---")
-    print(f"Samples per class: {np.unique(y_amp, return_counts=True)}")
+    if filter_amplitude_by_fatigue:
+        print("Using filtered data: only 'free' fatigue samples")
+    print(f"Total samples: {len(y_amp)}")
+    unique_classes, class_counts = np.unique(y_amp, return_counts=True)
+    print(f"Samples per amplitude class:")
+    for cls, count in zip(unique_classes, class_counts):
+        print(f"  {cls}: {count} samples")
     
     X_amp_train, X_amp_test, y_amp_train, y_amp_test = train_test_split(
         X_amp, y_amp, test_size=0.2, random_state=42, stratify=y_amp
@@ -221,19 +268,31 @@ def train_classifiers(train_dir, model_type='random_forest'):
     # Prepare data for fatigue classification (only 'full' amplitude)
     X_fat = []
     y_fat = []
+    subj_fat = []
     
     for seg in segments_data:
         if seg['amplitude'] == 'full' and seg['features'] is not None:
+            # Apply filtering if requested (already filtered by amplitude='full')
+            if filter_fatigue_by_amplitude and seg['amplitude'] != 'full':
+                continue
+            
             feature_values = list(seg['features'].values())
             X_fat.append(feature_values)
             y_fat.append(seg['fatigue'])
+            subj_fat.append(seg['subject_id'])
     
     X_fat = np.array(X_fat)
     y_fat = np.array(y_fat)
+    subj_fat = np.array(subj_fat)
     
     # Train fatigue classifier
     print("\n--- Training Fatigue Classifier ---")
-    print(f"Samples per class: {np.unique(y_fat, return_counts=True)}")
+    print("Using only 'full' amplitude samples (by constraint)")
+    print(f"Total samples: {len(y_fat)}")
+    unique_classes, class_counts = np.unique(y_fat, return_counts=True)
+    print(f"Samples per fatigue class:")
+    for cls, count in zip(unique_classes, class_counts):
+        print(f"  {cls}: {count} samples")
     
     X_fat_train, X_fat_test, y_fat_train, y_fat_test = train_test_split(
         X_fat, y_fat, test_size=0.2, random_state=42, stratify=y_fat
@@ -276,6 +335,10 @@ def main():
     STEP_SIZE = 100    # 0.05 seconds at 2000 Hz (50% overlap)
     MODEL_TYPE = 'random_forest'  # or 'xgboost'
     
+    # Filtering options for better accuracy
+    FILTER_AMPLITUDE_BY_FATIGUE = False  # Set to True to use only 'free' fatigue for amplitude
+    FILTER_FATIGUE_BY_AMPLITUDE = True   # Already enforced by using only 'full' amplitude
+    
     # Check if train directory exists
     if not os.path.exists(TRAIN_DIR):
         print(f"Error: Training directory '{TRAIN_DIR}' not found!")
@@ -298,7 +361,9 @@ def main():
     print("\nStep 2: Training Amplitude and Fatigue Classifiers...")
     amp_classifier, fat_classifier = train_classifiers(
         TRAIN_DIR,
-        model_type=MODEL_TYPE
+        model_type=MODEL_TYPE,
+        filter_amplitude_by_fatigue=FILTER_AMPLITUDE_BY_FATIGUE,
+        filter_fatigue_by_amplitude=FILTER_FATIGUE_BY_AMPLITUDE
     )
     
     # Save classifiers

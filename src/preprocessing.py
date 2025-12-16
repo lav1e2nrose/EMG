@@ -169,6 +169,86 @@ def label_windows_from_segments(signal_length, segment_ranges, window_size, step
     return np.array(labels), np.array(start_indices)
 
 
+def label_signal_three_state(signal_length, segment_ranges, concentric_ratio=0.6):
+    """
+    Create per-sample three-state labels.
+
+    States:
+        0: Background (rest)
+        1: Concentric / primary activation (large packet)
+        2: Eccentric / secondary activation (small packet)
+
+    Each manual segment is split into two phases based on concentric_ratio.
+    """
+    labels = np.zeros(signal_length, dtype=int)
+    ratio = np.clip(concentric_ratio, 0.1, 0.9)
+
+    for seg_start, seg_end in segment_ranges:
+        seg_start = max(0, int(seg_start))
+        seg_end = min(signal_length, int(seg_end))
+        if seg_end <= seg_start:
+            continue
+
+        seg_len = seg_end - seg_start
+        split = seg_start + int(seg_len * ratio)
+        labels[seg_start:split] = 1
+        labels[split:seg_end] = 2
+
+    return labels
+
+
+def create_sequence_windows_for_segmentation(signal, labels, sequence_length, step_size):
+    """
+    Create paired signal/label sequences for CRNN training or inference.
+    """
+    windows = []
+    label_windows = []
+
+    for start in range(0, len(signal) - sequence_length + 1, step_size):
+        end = start + sequence_length
+        windows.append(signal[start:end])
+        label_windows.append(labels[start:end])
+
+    return np.array(windows), np.array(label_windows)
+
+
+def decode_three_state_predictions(predictions, min_length=200, merge_gap=100):
+    """
+    Convert per-sample three-state predictions into (start, end) segments.
+    """
+    segments = []
+    in_segment = False
+    start_idx = 0
+
+    for idx, label in enumerate(predictions):
+        if label != 0 and not in_segment:
+            in_segment = True
+            start_idx = idx
+        elif label == 0 and in_segment:
+            in_segment = False
+            end_idx = idx
+            if end_idx - start_idx >= min_length:
+                segments.append((start_idx, end_idx))
+
+    if in_segment:
+        end_idx = len(predictions)
+        if end_idx - start_idx >= min_length:
+            segments.append((start_idx, end_idx))
+
+    # Merge close segments to handle brief pauses
+    if len(segments) > 1:
+        merged = [segments[0]]
+        for cur_start, cur_end in segments[1:]:
+            prev_start, prev_end = merged[-1]
+            if cur_start - prev_end <= merge_gap:
+                merged[-1] = (prev_start, cur_end)
+            else:
+                merged.append((cur_start, cur_end))
+        segments = merged
+
+    return segments
+
+
 def get_segment_ranges_from_files(raw_filepath, segment_dir):
     """
     Get segment ranges by comparing raw file length with segment files.

@@ -3,6 +3,7 @@ Unit tests for EMG signal analysis pipeline.
 """
 import unittest
 import numpy as np
+import torch
 import sys
 import os
 
@@ -11,13 +12,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../src'))
 from preprocessing import (
     bandpass_filter, notch_filter, preprocess_signal,
     create_sliding_windows, label_windows_from_segments,
-    detect_activity_segments
+    detect_activity_segments, label_signal_three_state,
+    create_sequence_windows_for_segmentation
 )
 from features import (
     compute_rms, compute_mav, compute_zc, compute_ssc, compute_wl,
     extract_all_features
 )
 from utils import parse_filename, validate_labels
+from models import CRNNActivitySegmenter
 
 
 class TestPreprocessing(unittest.TestCase):
@@ -100,6 +103,28 @@ class TestPreprocessing(unittest.TestCase):
         
         self.assertIsInstance(segments, list)
         self.assertTrue(all(isinstance(s, tuple) and len(s) == 2 for s in segments))
+
+    def test_label_signal_three_state(self):
+        """Three-state labeling splits segments into two phases."""
+        signal_length = 200
+        segment_ranges = [(20, 120)]
+        labels = label_signal_three_state(signal_length, segment_ranges, concentric_ratio=0.5)
+
+        self.assertEqual(len(labels), signal_length)
+        self.assertTrue(np.all(labels[:20] == 0))
+        self.assertTrue(np.all(labels[20:70] == 1))  # first half
+        self.assertTrue(np.all(labels[70:120] == 2))  # second half
+
+    def test_create_sequence_windows_for_segmentation(self):
+        """Windows and label windows stay aligned."""
+        signal = np.arange(20)
+        labels = np.zeros(20, dtype=int)
+        labels[5:10] = 1
+        windows, lbl = create_sequence_windows_for_segmentation(signal, labels, 10, 5)
+
+        self.assertEqual(windows.shape, lbl.shape)
+        self.assertEqual(windows.shape[1], 10)
+        self.assertTrue(np.array_equal(lbl[1, 0:5], labels[5:10]))
 
 
 class TestFeatures(unittest.TestCase):
@@ -218,6 +243,16 @@ class TestUtils(unittest.TestCase):
         
         for metadata in invalid_cases:
             self.assertFalse(validate_labels(metadata))
+
+
+class TestCRNN(unittest.TestCase):
+    """Lightweight CRNN sanity checks."""
+
+    def test_forward_shape(self):
+        model = CRNNActivitySegmenter(sequence_length=50, step_size=25, device="cpu")
+        dummy = np.random.randn(2, 50).astype(np.float32)
+        preds = model.predict(dummy)
+        self.assertEqual(preds.shape, (2, 50))
 
 
 if __name__ == '__main__':

@@ -327,3 +327,105 @@ class FatigueClassifier:
             self.model = data['model']
             self.label_encoder = data['label_encoder']
         print(f"Model loaded from {filepath}")
+
+
+# --- CRNN for three-state activity segmentation ---
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+
+
+class _CRNNBackbone(nn.Module):
+    def __init__(self, input_channels=1, conv_channels=32, lstm_hidden=64, num_classes=3):
+        super().__init__()
+        self.conv = nn.Conv1d(input_channels, conv_channels, kernel_size=5, padding=2)
+        self.relu = nn.ReLU(inplace=True)
+        self.bn = nn.BatchNorm1d(conv_channels)
+        self.dropout = nn.Dropout(0.2)
+        self.lstm = nn.LSTM(
+            input_size=conv_channels,
+            hidden_size=lstm_hidden,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.classifier = nn.Linear(lstm_hidden * 2, num_classes)
+
+    def forward(self, x):
+        # x: (batch, seq_len) or (batch, 1, seq_len)
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        x = self.conv(x)
+        x = self.bn(self.relu(x))
+        x = self.dropout(x)
+        x = x.transpose(1, 2)  # (batch, seq_len, channels)
+        x, _ = self.lstm(x)
+        logits = self.classifier(x)
+        return logits
+
+
+class CRNNActivitySegmenter:
+    """
+    Time-series semantic segmenter producing 0/1/2 labels per timestep.
+    """
+
+    def __init__(self, sequence_length=400, step_size=200, device=None):
+        self.sequence_length = sequence_length
+        self.step_size = step_size
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = _CRNNBackbone().to(self.device)
+
+    def fit(self, windows, labels, epochs=3, batch_size=32, lr=1e-3):
+        """
+        Train CRNN using paired signal/label sequences.
+        Args:
+            windows (np.array): shape (n_samples, seq_len)
+            labels (np.array): shape (n_samples, seq_len)
+        """
+        x_tensor = torch.tensor(windows, dtype=torch.float32)
+        y_tensor = torch.tensor(labels, dtype=torch.long)
+        dataset = TensorDataset(x_tensor, y_tensor)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(self.model.parameters(), lr=lr)
+
+        self.model.train()
+        for _ in range(epochs):
+            for xb, yb in loader:
+                xb = xb.to(self.device)
+                yb = yb.to(self.device)
+                optimizer.zero_grad()
+                logits = self.model(xb)
+                loss = criterion(logits.view(-1, 3), yb.view(-1))
+                loss.backward()
+                optimizer.step()
+
+    def predict(self, windows):
+        """
+        Predict per-timestep labels for given windows.
+        """
+        self.model.eval()
+        x_tensor = torch.tensor(windows, dtype=torch.float32).to(self.device)
+        with torch.no_grad():
+            logits = self.model(x_tensor)
+            preds = torch.argmax(logits, dim=-1).cpu().numpy()
+        return preds
+
+    def save(self, filepath):
+        torch.save(
+            {
+                "model_state_dict": self.model.state_dict(),
+                "sequence_length": self.sequence_length,
+                "step_size": self.step_size,
+            },
+            filepath,
+        )
+
+    def load(self, filepath):
+        checkpoint = torch.load(filepath, map_location=self.device)
+        self.sequence_length = checkpoint.get("sequence_length", self.sequence_length)
+        self.step_size = checkpoint.get("step_size", self.step_size)
+        self.model = _CRNNBackbone().to(self.device)
+        self.model.load_state_dict(checkpoint["model_state_dict"])

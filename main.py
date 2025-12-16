@@ -15,10 +15,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 from preprocessing import (
     load_emg_data, preprocess_signal, create_sliding_windows,
     label_windows_from_segments, improved_get_segment_ranges,
-    detect_activity_segments
+    detect_activity_segments, label_signal_three_state,
+    create_sequence_windows_for_segmentation, decode_three_state_predictions
 )
 from features import extract_features_from_windows, extract_segment_features
-from models import ActivityDetector, AmplitudeClassifier, FatigueClassifier
+from models import ActivityDetector, AmplitudeClassifier, FatigueClassifier, CRNNActivitySegmenter
 from utils import (
     parse_filename, get_train_files, load_segments_metadata,
     plot_confusion_matrix, print_classification_report
@@ -108,6 +109,73 @@ def train_activity_detector(train_dir, window_size=200, step_size=100,
     print(classification_report(y_test, y_pred, target_names=['Inactive', 'Active']))
     
     return detector
+
+
+def train_crnn_activity_segmenter(train_dir, sequence_length=400, step_size=200, epochs=3):
+    """
+    Train CRNN-based three-state activity segmenter.
+    """
+    print("\n=== Training CRNN Activity Segmenter ===")
+
+    file_data = get_train_files(train_dir)
+    window_buffer = []
+    label_buffer = []
+
+    for raw_file, segment_dir in file_data['segment_dirs'].items():
+        print(f"Processing {os.path.basename(raw_file)} for CRNN...")
+        raw_signal = load_emg_data(raw_file)
+        filtered_signal = preprocess_signal(raw_signal)
+        segment_ranges = improved_get_segment_ranges(raw_file, segment_dir)
+
+        if len(segment_ranges) == 0:
+            print(f"  Warning: No segments found for {raw_file}")
+            continue
+
+        per_sample_labels = label_signal_three_state(len(filtered_signal), segment_ranges)
+        windows, label_windows = create_sequence_windows_for_segmentation(
+            filtered_signal, per_sample_labels, sequence_length, step_size
+        )
+
+        window_buffer.append(windows)
+        label_buffer.append(label_windows)
+
+    if not window_buffer:
+        raise RuntimeError("No data available for CRNN training.")
+
+    X = np.vstack(window_buffer)
+    y = np.vstack(label_buffer)
+
+    print(f"CRNN training samples: {len(X)}, sequence length: {sequence_length}")
+
+    segmenter = CRNNActivitySegmenter(sequence_length=sequence_length, step_size=step_size)
+    segmenter.fit(X, y, epochs=epochs)
+    return segmenter
+
+
+def segment_signal_with_crnn(signal, segmenter):
+    """
+    Predict three-state labels and convert to segments.
+    """
+    seq_len = segmenter.sequence_length
+    step = segmenter.step_size
+
+    # Pad tail if needed
+    pad_length = (-(len(signal) - seq_len)) % step
+    if pad_length:
+        signal = np.pad(signal, (0, pad_length), mode='edge')
+
+    dummy_labels = np.zeros(len(signal), dtype=int)
+    windows, _ = create_sequence_windows_for_segmentation(signal, dummy_labels, seq_len, step)
+    preds = segmenter.predict(windows)
+    # Reconstruct per-sample predictions by overlap-averaging (simple majority)
+    per_sample = np.zeros(len(signal), dtype=int)
+    counts = np.zeros(len(signal), dtype=int)
+    for i, start in enumerate(range(0, len(signal) - seq_len + 1, step)):
+        per_sample[start:start + seq_len] += preds[i]
+        counts[start:start + seq_len] += 1
+    counts[counts == 0] = 1
+    per_sample = (per_sample / counts).round().astype(int)
+    return decode_three_state_predictions(per_sample)
 
 
 def segment_signal_with_detector(signal, detector, window_size=200, step_size=100):
@@ -344,18 +412,16 @@ def main():
         print(f"Error: Training directory '{TRAIN_DIR}' not found!")
         return
     
-    # Step 1: Train activity detector
-    print("\nStep 1: Training Activity Detector...")
-    activity_detector = train_activity_detector(
-        TRAIN_DIR, 
-        window_size=WINDOW_SIZE,
-        step_size=STEP_SIZE,
-        model_type=MODEL_TYPE
-    )
-    
-    # Save activity detector
+    # Step 1: Train CRNN activity segmenter
+    print("\nStep 1: Training CRNN Activity Segmenter...")
     os.makedirs('models', exist_ok=True)
-    activity_detector.save('models/activity_detector.pkl')
+    crnn_segmenter = train_crnn_activity_segmenter(
+        TRAIN_DIR,
+        sequence_length=400,
+        step_size=200,
+        epochs=3
+    )
+    crnn_segmenter.save('models/crnn_activity_segmenter.pt')
     
     # Step 2: Train amplitude and fatigue classifiers
     print("\nStep 2: Training Amplitude and Fatigue Classifiers...")

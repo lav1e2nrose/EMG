@@ -146,7 +146,8 @@ def label_windows_from_segments(signal_length, segment_ranges, window_size, step
     labels = []
     start_indices = []
     
-    min_overlap = max(1, int(window_size * overlap_threshold))
+    effective_threshold = max(overlap_threshold, 0.001)
+    min_overlap = max(1, int(np.ceil(window_size * effective_threshold)))
     
     for start in range(0, signal_length - window_size + 1, step_size):
         end = start + window_size
@@ -209,7 +210,8 @@ def get_segment_ranges_from_files(raw_filepath, segment_dir):
     return segments
 
 
-def find_segment_in_raw_signal(raw_signal, segment_signal, search_window=10000):
+def find_segment_in_raw_signal(raw_signal, segment_signal, search_window=10000,
+                               min_correlation=0.9):
     """
     Find where a segment appears in the raw signal using correlation.
     
@@ -217,6 +219,7 @@ def find_segment_in_raw_signal(raw_signal, segment_signal, search_window=10000):
         raw_signal: array-like, full raw signal
         segment_signal: array-like, segment to find
         search_window: int, maximum search window size
+        min_correlation: float, minimum correlation to accept a match
     
     Returns:
         int: start index of best match, or None if not found
@@ -237,14 +240,19 @@ def find_segment_in_raw_signal(raw_signal, segment_signal, search_window=10000):
         window = raw_signal[start:start + seg_len]
         window_norm = (window - np.mean(window)) / (np.std(window) + 1e-10)
         
+        if np.std(window_norm) < 1e-10 or np.std(seg_norm) < 1e-10:
+            continue
+        
         correlation = np.corrcoef(seg_norm, window_norm)[0, 1]
+        if np.isnan(correlation):
+            continue
         
         if correlation > best_correlation:
             best_correlation = correlation
             best_start = start
     
     # Return if correlation is high enough
-    if best_correlation > 0.9:
+    if best_correlation >= min_correlation:
         return best_start
     
     return None

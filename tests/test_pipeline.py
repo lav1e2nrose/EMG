@@ -85,8 +85,11 @@ class TestPreprocessing(unittest.TestCase):
             signal_length, segment_ranges, window_size, step_size, overlap_threshold=0.05
         )
         
-        # The window starting at 50 overlaps 55 samples with the segment
-        self.assertEqual(labels[1], 1)
+        start_positions = list(range(0, signal_length - window_size + 1, step_size))
+        idx_for_50 = start_positions.index(50)
+        
+        # The window starting at 50 overlaps 10 samples with the segment
+        self.assertEqual(labels[idx_for_50], 1)
     
     def test_detect_activity_segments(self):
         """Test segment detection from predictions."""

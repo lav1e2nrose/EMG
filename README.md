@@ -73,6 +73,12 @@ pip install -r requirements.txt
 python main.py
 ```
 
+### Run Unit Tests
+
+```bash
+python -m unittest tests/test_pipeline.py
+```
+
 This will:
 1. Train an activity detector using sliding window features
 2. Train amplitude and fatigue classifiers using manual segments

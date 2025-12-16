@@ -4,6 +4,7 @@ Provides interfaces for training and prediction with sklearn models.
 """
 import numpy as np
 import pickle
+import warnings
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
@@ -15,15 +16,18 @@ class ActivityDetector:
     Uses sliding window features to predict activity.
     """
     
-    def __init__(self, model_type='random_forest', **kwargs):
+    def __init__(self, model_type='random_forest', decision_threshold=0.6, **kwargs):
         """
         Initialize activity detector.
         
         Args:
             model_type: str, 'random_forest' or 'xgboost'
+            decision_threshold: float, probability threshold for classifying
+                                a window as active (0=inactive, 1=active).
             **kwargs: additional parameters for the model
         """
         self.model_type = model_type
+        self.decision_threshold = decision_threshold
         
         if model_type == 'random_forest':
             default_params = {
@@ -31,7 +35,8 @@ class ActivityDetector:
                 'max_depth': 10,
                 'min_samples_split': 5,
                 'random_state': 42,
-                'n_jobs': -1
+                'n_jobs': -1,
+                'class_weight': 'balanced'
             }
             default_params.update(kwargs)
             self.model = RandomForestClassifier(**default_params)
@@ -70,7 +75,39 @@ class ActivityDetector:
         Returns:
             np.array: binary predictions (0=inactive, 1=active)
         """
-        return self.model.predict(X)
+        proba = self.model.predict_proba(X)
+        
+        class_labels = None
+        active_idx = None
+        
+        if hasattr(self.model, "classes_"):
+            class_labels = np.array(self.model.classes_)
+            active_positions = np.where(class_labels == 1)[0]
+            if active_positions.size == 1:
+                active_idx = int(active_positions[0])
+            elif active_positions.size > 1:
+                warnings.warn(
+                    "Multiple occurrences of active class label '1' found; using the first.",
+                    RuntimeWarning,
+                )
+                active_idx = int(active_positions[0])
+            else:
+                warnings.warn(
+                    "Active class label '1' not found; falling back to the last probability column.",
+                    RuntimeWarning,
+                )
+        
+        if active_idx is None:
+            active_idx = proba.shape[1] - 1 if proba.shape[1] > 1 else 0
+        
+        if self.decision_threshold is None:
+            pred_indices = np.argmax(proba, axis=1)
+            if class_labels is not None:
+                predicted_labels = class_labels[pred_indices]
+                return (predicted_labels == 1).astype(int)
+            return pred_indices.astype(int)
+        
+        return (proba[:, active_idx] >= self.decision_threshold).astype(int)
     
     def predict_proba(self, X):
         """
@@ -119,7 +156,8 @@ class AmplitudeClassifier:
                 'max_depth': 15,
                 'min_samples_split': 5,
                 'random_state': 42,
-                'n_jobs': -1
+                'n_jobs': -1,
+                'class_weight': 'balanced'
             }
             default_params.update(kwargs)
             self.model = RandomForestClassifier(**default_params)
@@ -216,7 +254,8 @@ class FatigueClassifier:
                 'max_depth': 15,
                 'min_samples_split': 5,
                 'random_state': 42,
-                'n_jobs': -1
+                'n_jobs': -1,
+                'class_weight': 'balanced'
             }
             default_params.update(kwargs)
             self.model = RandomForestClassifier(**default_params)

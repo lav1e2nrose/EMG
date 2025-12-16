@@ -125,7 +125,8 @@ def compute_rms(window):
     return np.sqrt(np.mean(window ** 2))
 
 
-def label_windows_from_segments(signal_length, segment_ranges, window_size, step_size):
+def label_windows_from_segments(signal_length, segment_ranges, window_size, step_size,
+                                overlap_threshold=0.1):
     """
     Create binary labels for sliding windows based on manual segmentation.
     Label is 1 if window overlaps with any segment, 0 otherwise.
@@ -135,6 +136,8 @@ def label_windows_from_segments(signal_length, segment_ranges, window_size, step
         segment_ranges: list of tuples (start, end) for active segments
         window_size: int, size of each window in samples
         step_size: int, step size between windows in samples
+        overlap_threshold: float, minimum fraction of window that must overlap
+                          with a segment to be considered active
     
     Returns:
         np.array: binary labels for each window (1=active, 0=inactive)
@@ -143,17 +146,21 @@ def label_windows_from_segments(signal_length, segment_ranges, window_size, step
     labels = []
     start_indices = []
     
+    effective_threshold = max(overlap_threshold, 0.001)
+    min_overlap = max(1, int(np.ceil(window_size * effective_threshold)))
+    
     for start in range(0, signal_length - window_size + 1, step_size):
         end = start + window_size
         start_indices.append(start)
         
         # Check if window overlaps with any segment
         is_active = False
-        window_center = (start + end) // 2
         
         for seg_start, seg_end in segment_ranges:
-            # Consider window active if its center is within a segment
-            if seg_start <= window_center <= seg_end:
+            overlap = min(end, seg_end) - max(start, seg_start)
+            
+            # Consider window active if sufficient overlap with any segment
+            if overlap >= min_overlap:
                 is_active = True
                 break
         
@@ -203,7 +210,8 @@ def get_segment_ranges_from_files(raw_filepath, segment_dir):
     return segments
 
 
-def find_segment_in_raw_signal(raw_signal, segment_signal, search_window=10000):
+def find_segment_in_raw_signal(raw_signal, segment_signal, search_window=10000,
+                               min_correlation=0.9):
     """
     Find where a segment appears in the raw signal using correlation.
     
@@ -211,6 +219,7 @@ def find_segment_in_raw_signal(raw_signal, segment_signal, search_window=10000):
         raw_signal: array-like, full raw signal
         segment_signal: array-like, segment to find
         search_window: int, maximum search window size
+        min_correlation: float, minimum correlation to accept a match
     
     Returns:
         int: start index of best match, or None if not found
@@ -231,14 +240,19 @@ def find_segment_in_raw_signal(raw_signal, segment_signal, search_window=10000):
         window = raw_signal[start:start + seg_len]
         window_norm = (window - np.mean(window)) / (np.std(window) + 1e-10)
         
+        if np.std(window_norm) < 1e-10 or np.std(seg_norm) < 1e-10:
+            continue
+        
         correlation = np.corrcoef(seg_norm, window_norm)[0, 1]
+        if np.isnan(correlation):
+            continue
         
         if correlation > best_correlation:
             best_correlation = correlation
             best_start = start
     
     # Return if correlation is high enough
-    if best_correlation > 0.9:
+    if best_correlation >= min_correlation:
         return best_start
     
     return None

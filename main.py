@@ -97,7 +97,8 @@ def train_activity_detector(train_dir, window_size=200, step_size=100,
     
     # Train model
     print(f"\nTraining {model_type} model...")
-    detector = ActivityDetector(model_type=model_type, decision_threshold=0.6)
+    # Lower threshold (0.4) for better recall on activity detection
+    detector = ActivityDetector(model_type=model_type, decision_threshold=0.4)
     detector.fit(X_train, y_train)
     
     # Evaluate
@@ -419,9 +420,20 @@ def main():
         print(f"Error: Training directory '{TRAIN_DIR}' not found!")
         return
     
-    # Step 1: Train CRNN activity segmenter
-    print("\nStep 1: Training CRNN Activity Segmenter...")
     os.makedirs('models', exist_ok=True)
+    
+    # Step 1a: Train Activity Detector (sliding window classifier)
+    print("\nStep 1a: Training Activity Detector...")
+    activity_detector = train_activity_detector(
+        TRAIN_DIR,
+        window_size=WINDOW_SIZE,
+        step_size=STEP_SIZE,
+        model_type=MODEL_TYPE
+    )
+    activity_detector.save('models/activity_detector.pkl')
+    
+    # Step 1b: Train CRNN activity segmenter
+    print("\nStep 1b: Training CRNN Activity Segmenter...")
     crnn_segmenter = train_crnn_activity_segmenter(
         TRAIN_DIR,
         sequence_length=400,
@@ -447,6 +459,7 @@ def main():
     print("Pipeline completed successfully!")
     print("=" * 60)
     print("\nModels saved to 'models/' directory:")
+    print("  - activity_detector.pkl")
     print("  - crnn_activity_segmenter.pt")
     print("  - amplitude_classifier.pkl")
     print("  - fatigue_classifier.pkl")

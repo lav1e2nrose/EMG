@@ -16,6 +16,10 @@ DEFAULT_MIN_SEGMENT_MS = 500    # Minimum segment duration (ms)
 DEFAULT_MERGE_GAP_MS = 300      # Merge segments closer than this (ms)
 DEFAULT_SAMPLING_RATE = 2000    # Default sampling rate (Hz)
 
+# Fallback parameters for segment detection when correlation matching fails
+FALLBACK_MIN_SEGMENT_MS_OPTIONS = [200, 300, 500]  # Try increasingly strict min segment lengths
+FALLBACK_THRESHOLD_MULTIPLIERS = [1.0, 0.8, 0.6, 0.5]  # Try increasingly sensitive thresholds
+
 
 def load_emg_data(filepath):
     """
@@ -690,18 +694,16 @@ def improved_get_segment_ranges(raw_filepath, segment_dir):
     segment_files = sorted([f for f in os.listdir(segment_dir) if f.endswith('.csv')])
     num_manual_segments = len(segment_files)
     
-    # Calculate total length of all manual segments
+    # Track total length for fallback decision
     total_segment_length = 0
-    segment_lengths = []
     for seg_file in segment_files:
         seg_path = os.path.join(segment_dir, seg_file)
         seg_data = load_emg_data(seg_path)
-        segment_lengths.append(len(seg_data))
         total_segment_length += len(seg_data)
     
     # Try correlation-based matching first
     segment_ranges = []
-    for i, seg_file in enumerate(segment_files):
+    for seg_file in segment_files:
         seg_path = os.path.join(segment_dir, seg_file)
         seg_data = load_emg_data(seg_path)
         seg_filtered = preprocess_signal(seg_data)
@@ -722,8 +724,8 @@ def improved_get_segment_ranges(raw_filepath, segment_dir):
     if num_manual_segments > 0 and total_segment_length > 0:
         # Try with different min_segment_ms and threshold combinations
         # Start with more permissive parameters (smaller min_segment_ms)
-        for min_seg_ms in [200, 300, 500]:
-            for threshold_mult in [1.0, 0.8, 0.6, 0.5]:
+        for min_seg_ms in FALLBACK_MIN_SEGMENT_MS_OPTIONS:
+            for threshold_mult in FALLBACK_THRESHOLD_MULTIPLIERS:
                 auto_segments = detect_activity_regions(
                     raw_filtered, 
                     fs=2000,

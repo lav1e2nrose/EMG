@@ -6,7 +6,7 @@ import os
 import sys
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
 # Add src to path
@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 from preprocessing import (
     load_emg_data, preprocess_signal, create_sliding_windows,
     label_windows_from_segments, improved_get_segment_ranges,
-    detect_activity_segments
+    detect_activity_segments, segment_signal_improved
 )
 from features import extract_features_from_windows, extract_segment_features
 from models import ActivityDetector, AmplitudeClassifier, FatigueClassifier
@@ -112,23 +112,27 @@ def train_activity_detector(train_dir, window_size=200, step_size=100,
 
 
 def train_per_subject_classifiers(train_dir, model_type='random_forest', 
-                                  filter_amplitude_by_fatigue=False,
-                                  filter_fatigue_by_amplitude=False,
-                                  use_per_subject=True):
+                                  filter_amplitude_by_fatigue=True,
+                                  filter_fatigue_by_amplitude=True,
+                                  use_per_subject=True,
+                                  n_folds=5):
     """
-    Train amplitude and fatigue classifiers with per-subject learning.
+    Train amplitude and fatigue classifiers with per-subject learning and k-fold cross-validation.
     
     Args:
         train_dir: str, path to training directory
         model_type: str, 'random_forest' or 'xgboost'
         filter_amplitude_by_fatigue: bool, if True, use only 'free' fatigue for amplitude
+                                     (Default: True - amplitude classes only apply to 'free' state)
         filter_fatigue_by_amplitude: bool, if True, use only 'full' amplitude for fatigue
+                                     (Default: True - fatigue only applies to 'full' amplitude)
         use_per_subject: bool, if True, use per-subject learning
+        n_folds: int, number of folds for cross-validation (default: 5)
     
     Returns:
         tuple: (classifier, classifier) for amplitude and fatigue
     """
-    print("\n=== Training Classifiers with Per-Subject Learning ===")
+    print("\n=== Training Classifiers with Per-Subject Learning and K-Fold CV ===")
     
     # Collect all segment data
     segments_data = []
@@ -186,13 +190,14 @@ def train_per_subject_classifiers(train_dir, model_type='random_forest',
         print(f"  Subject {subj}: {subject_counts[subj]} samples")
     
     # Prepare data for amplitude classification
+    # IMPORTANT: Amplitude classification (full/half/invalid) only applies to 'free' fatigue state
     X_amp = []
     y_amp = []
     subj_amp = []
     
     for seg in segments_data:
         if seg['features'] is not None:
-            # Apply filtering if requested
+            # Apply filtering: amplitude classes only apply when fatigue is 'free'
             if filter_amplitude_by_fatigue and seg['fatigue'] != 'free':
                 continue
             
@@ -205,59 +210,89 @@ def train_per_subject_classifiers(train_dir, model_type='random_forest',
     y_amp = np.array(y_amp)
     subj_amp = np.array(subj_amp)
     
-    # Train amplitude classifier
-    print("\n--- Training Amplitude Classifier ---")
+    # Train amplitude classifier with k-fold cross-validation
+    print("\n--- Training Amplitude Classifier with K-Fold CV ---")
     if filter_amplitude_by_fatigue:
-        print("Using filtered data: only 'free' fatigue samples")
+        print("Using filtered data: only 'free' fatigue samples (amplitude classification only applies to 'free' state)")
     print(f"Total samples: {len(y_amp)}")
     unique_classes, class_counts = np.unique(y_amp, return_counts=True)
     print(f"Samples per amplitude class:")
     for cls, count in zip(unique_classes, class_counts):
         print(f"  {cls}: {count} samples")
+    print(f"Using {n_folds}-fold cross-validation")
     
-    # Split data
-    X_amp_train, X_amp_test, y_amp_train, y_amp_test, subj_amp_train, subj_amp_test = train_test_split(
-        X_amp, y_amp, subj_amp, test_size=0.2, random_state=42, stratify=y_amp
-    )
+    # K-fold cross-validation for amplitude classifier
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
     
-    if use_per_subject:
-        print("\nUsing per-subject learning for amplitude classification...")
-        amp_classifier = PerSubjectClassifier(model_type=model_type)
-        amp_classifier.fit(X_amp_train, y_amp_train, subj_amp_train)
+    all_y_amp_true = []
+    all_y_amp_pred = []
+    amp_fold_accuracies = []
+    
+    for fold, (train_idx, test_idx) in enumerate(skf.split(X_amp, y_amp)):
+        X_train, X_test = X_amp[train_idx], X_amp[test_idx]
+        y_train, y_test = y_amp[train_idx], y_amp[test_idx]
+        subj_train, subj_test = subj_amp[train_idx], subj_amp[test_idx]
         
-        # Evaluate with per-subject predictions
-        y_amp_pred = amp_classifier.predict(X_amp_test, subj_amp_test)
+        # Train model for this fold
+        if use_per_subject:
+            fold_classifier = PerSubjectClassifier(model_type=model_type)
+            fold_classifier.fit(X_train, y_train, subj_train)
+            y_pred = fold_classifier.predict(X_test, subj_test)
+        else:
+            fold_classifier = AmplitudeClassifier(model_type=model_type)
+            fold_classifier.fit(X_train, y_train)
+            y_pred = fold_classifier.predict(X_test)
+        
+        # Collect predictions
+        all_y_amp_true.extend(y_test)
+        all_y_amp_pred.extend(y_pred)
+        
+        fold_acc = accuracy_score(y_test, y_pred)
+        amp_fold_accuracies.append(fold_acc)
+        print(f"  Fold {fold+1}: Accuracy = {fold_acc:.4f}")
+    
+    # Train final model on all data
+    if use_per_subject:
+        amp_classifier = PerSubjectClassifier(model_type=model_type)
+        amp_classifier.fit(X_amp, y_amp, subj_amp)
     else:
-        print("\nUsing standard learning for amplitude classification...")
         amp_classifier = AmplitudeClassifier(model_type=model_type)
-        amp_classifier.fit(X_amp_train, y_amp_train)
-        y_amp_pred = amp_classifier.predict(X_amp_test)
+        amp_classifier.fit(X_amp, y_amp)
     
-    amp_accuracy = accuracy_score(y_amp_test, y_amp_pred)
+    # Compute overall metrics from cross-validation
+    all_y_amp_true = np.array(all_y_amp_true)
+    all_y_amp_pred = np.array(all_y_amp_pred)
     
-    print(f"\nAmplitude Classifier Accuracy: {amp_accuracy:.4f}")
-    print("\nClassification Report:")
+    amp_accuracy = accuracy_score(all_y_amp_true, all_y_amp_pred)
+    print(f"\nAmplitude Classifier CV Accuracy: {amp_accuracy:.4f} (+/- {np.std(amp_fold_accuracies):.4f})")
+    print("\nClassification Report (aggregated from all folds):")
     print_classification_report(
-        y_amp_test, y_amp_pred,
+        all_y_amp_true, all_y_amp_pred,
         labels=amp_classifier.get_classes(),
         target_names=amp_classifier.get_classes()
     )
     
-    # Plot confusion matrix
+    # Plot confusion matrix with aggregated predictions from all folds
+    suffix = '_ps' if use_per_subject else ''
     plot_confusion_matrix(
-        y_amp_test, y_amp_pred,
+        all_y_amp_true, all_y_amp_pred,
         labels=amp_classifier.get_classes(),
-        title='Amplitude Classification Confusion Matrix (Per-Subject)' if use_per_subject else 'Amplitude Classification Confusion Matrix',
-        save_path='amplitude_confusion_matrix_ps.png' if use_per_subject else 'amplitude_confusion_matrix.png'
+        title=f'Amplitude Classification Confusion Matrix ({n_folds}-Fold CV)',
+        save_path=f'amplitude_confusion_matrix{suffix}.png'
     )
     
     # Prepare data for fatigue classification
+    # IMPORTANT: Fatigue classification only applies to 'full' amplitude samples
     X_fat = []
     y_fat = []
     subj_fat = []
     
     for seg in segments_data:
-        if seg['amplitude'] == 'full' and seg['features'] is not None:
+        if seg['features'] is not None:
+            # Fatigue classification only applies to 'full' amplitude
+            if filter_fatigue_by_amplitude and seg['amplitude'] != 'full':
+                continue
+            
             feature_values = list(seg['features'].values())
             X_fat.append(feature_values)
             y_fat.append(seg['fatigue'])
@@ -267,49 +302,71 @@ def train_per_subject_classifiers(train_dir, model_type='random_forest',
     y_fat = np.array(y_fat)
     subj_fat = np.array(subj_fat)
     
-    # Train fatigue classifier
-    print("\n--- Training Fatigue Classifier ---")
-    print("Using only 'full' amplitude samples (by constraint)")
+    # Train fatigue classifier with k-fold cross-validation
+    print("\n--- Training Fatigue Classifier with K-Fold CV ---")
+    print("Using only 'full' amplitude samples (fatigue classification only applies to 'full' amplitude)")
     print(f"Total samples: {len(y_fat)}")
     unique_classes, class_counts = np.unique(y_fat, return_counts=True)
     print(f"Samples per fatigue class:")
     for cls, count in zip(unique_classes, class_counts):
         print(f"  {cls}: {count} samples")
+    print(f"Using {n_folds}-fold cross-validation")
     
-    # Split data
-    X_fat_train, X_fat_test, y_fat_train, y_fat_test, subj_fat_train, subj_fat_test = train_test_split(
-        X_fat, y_fat, subj_fat, test_size=0.2, random_state=42, stratify=y_fat
-    )
+    # K-fold cross-validation for fatigue classifier
+    all_y_fat_true = []
+    all_y_fat_pred = []
+    fat_fold_accuracies = []
     
-    if use_per_subject:
-        print("\nUsing per-subject learning for fatigue classification...")
-        fat_classifier = PerSubjectClassifier(model_type=model_type)
-        fat_classifier.fit(X_fat_train, y_fat_train, subj_fat_train)
+    for fold, (train_idx, test_idx) in enumerate(skf.split(X_fat, y_fat)):
+        X_train, X_test = X_fat[train_idx], X_fat[test_idx]
+        y_train, y_test = y_fat[train_idx], y_fat[test_idx]
+        subj_train, subj_test = subj_fat[train_idx], subj_fat[test_idx]
         
-        # Evaluate with per-subject predictions
-        y_fat_pred = fat_classifier.predict(X_fat_test, subj_fat_test)
+        # Train model for this fold
+        if use_per_subject:
+            fold_classifier = PerSubjectClassifier(model_type=model_type)
+            fold_classifier.fit(X_train, y_train, subj_train)
+            y_pred = fold_classifier.predict(X_test, subj_test)
+        else:
+            fold_classifier = FatigueClassifier(model_type=model_type)
+            fold_classifier.fit(X_train, y_train)
+            y_pred = fold_classifier.predict(X_test)
+        
+        # Collect predictions
+        all_y_fat_true.extend(y_test)
+        all_y_fat_pred.extend(y_pred)
+        
+        fold_acc = accuracy_score(y_test, y_pred)
+        fat_fold_accuracies.append(fold_acc)
+        print(f"  Fold {fold+1}: Accuracy = {fold_acc:.4f}")
+    
+    # Train final model on all data
+    if use_per_subject:
+        fat_classifier = PerSubjectClassifier(model_type=model_type)
+        fat_classifier.fit(X_fat, y_fat, subj_fat)
     else:
-        print("\nUsing standard learning for fatigue classification...")
         fat_classifier = FatigueClassifier(model_type=model_type)
-        fat_classifier.fit(X_fat_train, y_fat_train)
-        y_fat_pred = fat_classifier.predict(X_fat_test)
+        fat_classifier.fit(X_fat, y_fat)
     
-    fat_accuracy = accuracy_score(y_fat_test, y_fat_pred)
+    # Compute overall metrics from cross-validation
+    all_y_fat_true = np.array(all_y_fat_true)
+    all_y_fat_pred = np.array(all_y_fat_pred)
     
-    print(f"\nFatigue Classifier Accuracy: {fat_accuracy:.4f}")
-    print("\nClassification Report:")
+    fat_accuracy = accuracy_score(all_y_fat_true, all_y_fat_pred)
+    print(f"\nFatigue Classifier CV Accuracy: {fat_accuracy:.4f} (+/- {np.std(fat_fold_accuracies):.4f})")
+    print("\nClassification Report (aggregated from all folds):")
     print_classification_report(
-        y_fat_test, y_fat_pred,
+        all_y_fat_true, all_y_fat_pred,
         labels=fat_classifier.get_classes(),
         target_names=fat_classifier.get_classes()
     )
     
-    # Plot confusion matrix
+    # Plot confusion matrix with aggregated predictions from all folds
     plot_confusion_matrix(
-        y_fat_test, y_fat_pred,
+        all_y_fat_true, all_y_fat_pred,
         labels=fat_classifier.get_classes(),
-        title='Fatigue Classification Confusion Matrix (Per-Subject)' if use_per_subject else 'Fatigue Classification Confusion Matrix',
-        save_path='fatigue_confusion_matrix_ps.png' if use_per_subject else 'fatigue_confusion_matrix.png'
+        title=f'Fatigue Classification Confusion Matrix ({n_folds}-Fold CV)',
+        save_path=f'fatigue_confusion_matrix{suffix}.png'
     )
     
     return amp_classifier, fat_classifier
@@ -326,13 +383,16 @@ def main():
     WINDOW_SIZE = 200  # 0.1 seconds at 2000 Hz
     STEP_SIZE = 100    # 0.05 seconds at 2000 Hz (50% overlap)
     MODEL_TYPE = 'random_forest'  # or 'xgboost'
+    N_FOLDS = 5  # Number of folds for cross-validation
     
     # Per-subject learning options
     USE_PER_SUBJECT = True  # Enable per-subject learning for better accuracy
     
     # Filtering options
-    FILTER_AMPLITUDE_BY_FATIGUE = False  # Set to True to use only 'free' fatigue
-    FILTER_FATIGUE_BY_AMPLITUDE = True   # Already enforced (only 'full' amplitude)
+    # Amplitude classification only applies to 'free' fatigue state
+    FILTER_AMPLITUDE_BY_FATIGUE = True   # Use only 'free' fatigue for amplitude classification
+    # Fatigue classification only applies to 'full' amplitude
+    FILTER_FATIGUE_BY_AMPLITUDE = True   # Use only 'full' amplitude for fatigue classification
     
     # Check if train directory exists
     if not os.path.exists(TRAIN_DIR):
@@ -352,14 +412,15 @@ def main():
     os.makedirs('models', exist_ok=True)
     activity_detector.save('models/activity_detector.pkl')
     
-    # Step 2: Train amplitude and fatigue classifiers with per-subject learning
-    print("\nStep 2: Training Classifiers with Per-Subject Learning...")
+    # Step 2: Train amplitude and fatigue classifiers with per-subject learning and k-fold CV
+    print("\nStep 2: Training Classifiers with Per-Subject Learning and K-Fold CV...")
     amp_classifier, fat_classifier = train_per_subject_classifiers(
         TRAIN_DIR,
         model_type=MODEL_TYPE,
         filter_amplitude_by_fatigue=FILTER_AMPLITUDE_BY_FATIGUE,
         filter_fatigue_by_amplitude=FILTER_FATIGUE_BY_AMPLITUDE,
-        use_per_subject=USE_PER_SUBJECT
+        use_per_subject=USE_PER_SUBJECT,
+        n_folds=N_FOLDS
     )
     
     # Save classifiers

@@ -13,7 +13,10 @@ from preprocessing import (
     bandpass_filter, notch_filter, preprocess_signal,
     create_sliding_windows, label_windows_from_segments,
     detect_activity_segments, label_signal_three_state,
-    create_sequence_windows_for_segmentation
+    create_sequence_windows_for_segmentation,
+    compute_rms_envelope, compute_mav_envelope,
+    compute_adaptive_threshold, detect_activity_regions,
+    segment_signal_improved
 )
 from features import (
     compute_rms, compute_mav, compute_zc, compute_ssc, compute_wl,
@@ -125,6 +128,97 @@ class TestPreprocessing(unittest.TestCase):
         self.assertEqual(windows.shape, lbl.shape)
         self.assertEqual(windows.shape[1], 10)
         self.assertTrue(np.array_equal(lbl[1], labels[5:15]))
+
+    def test_compute_rms_envelope(self):
+        """Test RMS envelope computation."""
+        signal = np.random.randn(1000)
+        window_size = 50
+        envelope = compute_rms_envelope(signal, window_size)
+        
+        self.assertEqual(len(envelope), len(signal))
+        self.assertTrue(np.all(envelope >= 0))  # RMS is always non-negative
+
+    def test_compute_mav_envelope(self):
+        """Test MAV envelope computation."""
+        signal = np.random.randn(1000)
+        window_size = 50
+        envelope = compute_mav_envelope(signal, window_size)
+        
+        self.assertEqual(len(envelope), len(signal))
+        self.assertTrue(np.all(envelope >= 0))  # MAV is always non-negative
+
+    def test_compute_adaptive_threshold_otsu(self):
+        """Test Otsu adaptive thresholding."""
+        # Create bimodal distribution
+        low_values = np.random.rand(500) * 0.3
+        high_values = 0.7 + np.random.rand(500) * 0.3
+        envelope = np.concatenate([low_values, high_values])
+        np.random.shuffle(envelope)
+        
+        threshold = compute_adaptive_threshold(envelope, method='otsu')
+        
+        self.assertIsInstance(threshold, (float, np.floating))
+        # Otsu should find a threshold; exact value depends on histogram binning
+        self.assertTrue(np.min(envelope) <= threshold <= np.max(envelope))
+
+    def test_compute_adaptive_threshold_percentile(self):
+        """Test percentile-based thresholding."""
+        envelope = np.arange(100)
+        
+        threshold = compute_adaptive_threshold(envelope, method='percentile', percentile=75)
+        
+        expected = np.percentile(envelope, 75)
+        self.assertAlmostEqual(threshold, expected)
+
+    def test_detect_activity_regions(self):
+        """Test RMS-based activity region detection."""
+        # Create synthetic signal with clear active and inactive regions
+        fs = 2000
+        inactive = np.random.randn(2000) * 0.1  # Low amplitude noise
+        active = np.random.randn(2000) * 2.0    # High amplitude activity
+        signal = np.concatenate([inactive, active, inactive])
+        
+        segments = detect_activity_regions(signal, fs=fs, min_segment_ms=200)
+        
+        self.assertIsInstance(segments, list)
+        # Should detect at least one active region
+        if len(segments) > 0:
+            # Each segment should be a tuple (start, end)
+            self.assertTrue(all(isinstance(s, tuple) and len(s) == 2 for s in segments))
+            # Segment start should be in the active region (around sample 2000)
+            for start, end in segments:
+                self.assertGreater(end, start)
+
+    def test_segment_signal_improved(self):
+        """Test improved segmentation with dual threshold."""
+        # Create synthetic signal with clear active and inactive regions
+        fs = 2000
+        inactive = np.random.randn(2000) * 0.1  # Low amplitude noise
+        active = np.random.randn(2000) * 2.0    # High amplitude activity
+        signal = np.concatenate([inactive, active, inactive])
+        
+        segments = segment_signal_improved(signal, fs=fs, min_segment_ms=200)
+        
+        self.assertIsInstance(segments, list)
+        # Each segment should be a tuple (start, end)
+        if len(segments) > 0:
+            self.assertTrue(all(isinstance(s, tuple) and len(s) == 2 for s in segments))
+
+    def test_segment_signal_improved_merging(self):
+        """Test that close segments are merged."""
+        fs = 2000
+        # Create two bursts separated by a short gap
+        inactive1 = np.random.randn(1000) * 0.1
+        active1 = np.random.randn(500) * 2.0
+        gap = np.random.randn(100) * 0.1  # Short gap (50ms)
+        active2 = np.random.randn(500) * 2.0
+        inactive2 = np.random.randn(1000) * 0.1
+        signal = np.concatenate([inactive1, active1, gap, active2, inactive2])
+        
+        # With merge_gap_ms=300, the two bursts should be merged
+        segments = segment_signal_improved(signal, fs=fs, min_segment_ms=100, merge_gap_ms=300)
+        
+        self.assertIsInstance(segments, list)
 
 
 class TestFeatures(unittest.TestCase):

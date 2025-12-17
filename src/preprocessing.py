@@ -445,9 +445,9 @@ def segment_signal_improved(signal, fs=2000, rms_window_ms=50,
         
         # Extend end forward to local minimum (within limit)
         search_end = min(len(signal), end + min_segment_samples // 4)
-        if end < search_end:
+        if end < search_end and end > 0:
             local_min_end = end + np.argmin(combined_env[end:search_end])
-            if combined_env[local_min_end] < combined_env[end-1] * 0.8:
+            if local_min_end < len(combined_env) and combined_env[local_min_end] < combined_env[end-1] * 0.8:
                 end = local_min_end
         
         refined_segments.append((start, end))

@@ -671,6 +671,7 @@ def find_segment_in_raw_signal(raw_signal, segment_signal, search_window=10000,
 def improved_get_segment_ranges(raw_filepath, segment_dir):
     """
     Get segment ranges by finding actual matches between raw and segment signals.
+    Falls back to automatic RMS-based detection if correlation matching fails.
     
     Args:
         raw_filepath: str, path to raw CSV file
@@ -685,11 +686,22 @@ def improved_get_segment_ranges(raw_filepath, segment_dir):
     raw_signal = load_emg_data(raw_filepath)
     raw_filtered = preprocess_signal(raw_signal)
     
-    # Load all segments
+    # Load all segments and their metadata
     segment_files = sorted([f for f in os.listdir(segment_dir) if f.endswith('.csv')])
-    segment_ranges = []
+    num_manual_segments = len(segment_files)
     
+    # Calculate total length of all manual segments
+    total_segment_length = 0
+    segment_lengths = []
     for seg_file in segment_files:
+        seg_path = os.path.join(segment_dir, seg_file)
+        seg_data = load_emg_data(seg_path)
+        segment_lengths.append(len(seg_data))
+        total_segment_length += len(seg_data)
+    
+    # Try correlation-based matching first
+    segment_ranges = []
+    for i, seg_file in enumerate(segment_files):
         seg_path = os.path.join(segment_dir, seg_file)
         seg_data = load_emg_data(seg_path)
         seg_filtered = preprocess_signal(seg_data)
@@ -701,6 +713,30 @@ def improved_get_segment_ranges(raw_filepath, segment_dir):
             end_idx = start_idx + len(seg_data)
             segment_ranges.append((start_idx, end_idx))
     
+    # If correlation matching found segments, return them
+    if len(segment_ranges) > 0:
+        return segment_ranges
+    
+    # Fallback: Use automatic RMS-based detection with multiple parameter attempts
+    # Try different parameter combinations to find segments
+    if num_manual_segments > 0 and total_segment_length > 0:
+        # Try with different min_segment_ms and threshold combinations
+        # Start with more permissive parameters (smaller min_segment_ms)
+        for min_seg_ms in [200, 300, 500]:
+            for threshold_mult in [1.0, 0.8, 0.6, 0.5]:
+                auto_segments = detect_activity_regions(
+                    raw_filtered, 
+                    fs=2000,
+                    min_segment_ms=min_seg_ms,
+                    merge_gap_ms=200,  # Use smaller merge gap for better segment separation
+                    threshold_multiplier=threshold_mult
+                )
+                
+                # If we found at least some segments, use them
+                if len(auto_segments) > 0:
+                    return auto_segments
+    
+    # Last resort: return empty list (no segments found)
     return segment_ranges
 
 

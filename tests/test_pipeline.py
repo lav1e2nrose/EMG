@@ -16,7 +16,7 @@ from preprocessing import (
     create_sequence_windows_for_segmentation,
     compute_rms_envelope, compute_mav_envelope,
     compute_adaptive_threshold, detect_activity_regions,
-    segment_signal_improved
+    segment_signal_improved, improved_get_segment_ranges
 )
 from features import (
     compute_rms, compute_mav, compute_zc, compute_ssc, compute_wl,
@@ -219,6 +219,40 @@ class TestPreprocessing(unittest.TestCase):
         segments = segment_signal_improved(signal, fs=fs, min_segment_ms=100, merge_gap_ms=300)
         
         self.assertIsInstance(segments, list)
+
+    def test_improved_get_segment_ranges_with_fallback(self):
+        """Test that improved_get_segment_ranges falls back to automatic detection."""
+        # Skip if train directory doesn't exist
+        train_dir = os.path.join(os.path.dirname(__file__), '..', 'train')
+        if not os.path.exists(train_dir):
+            self.skipTest("Train directory not found")
+        
+        # Find a file that has segments directory
+        test_file = None
+        test_segment_dir = None
+        for item in os.listdir(train_dir):
+            if item.endswith('.csv'):
+                segment_dir = os.path.join(train_dir, item.replace('.csv', '_segments'))
+                if os.path.exists(segment_dir) and os.listdir(segment_dir):
+                    test_file = os.path.join(train_dir, item)
+                    test_segment_dir = segment_dir
+                    break
+        
+        if test_file is None:
+            self.skipTest("No test files with segments found")
+        
+        # Call improved_get_segment_ranges
+        ranges = improved_get_segment_ranges(test_file, test_segment_dir)
+        
+        # Should find at least some segments
+        self.assertIsInstance(ranges, list)
+        self.assertGreater(len(ranges), 0, "Should find at least one segment")
+        
+        # Each range should be a tuple (start, end)
+        for r in ranges:
+            self.assertIsInstance(r, tuple)
+            self.assertEqual(len(r), 2)
+            self.assertLess(r[0], r[1])  # start < end
 
 
 class TestFeatures(unittest.TestCase):

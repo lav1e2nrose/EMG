@@ -25,12 +25,22 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from scipy.signal import butter, filtfilt, correlate
-from scipy.ndimage import maximum_filter1d
+from scipy.signal import butter, filtfilt
 import warnings
-warnings.filterwarnings('ignore')
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
 
-plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
+# 配置常量
+TARGET_LENGTH = 2000  # 统一信号长度
+RANDOM_SEED = 42      # 随机种子
+MAX_RAW_FILES = 5     # 处理原始文件数量限制
+PE_SCALE = 10000.0    # 位置编码缩放因子
+
+# 字体配置
+try:
+    plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'sans-serif']
+except Exception:
+    pass
 plt.rcParams['axes.unicode_minus'] = False
 
 
@@ -262,8 +272,11 @@ def train_pattern_detector(detector, segments, labels_amp, epochs=50, device='cp
     - 学习动作模式（正样本：真实动作）
     - 学习背景模式（负样本：随机噪声/静止段）
     """
+    # 设置随机种子确保可重复性
+    np.random.seed(RANDOM_SEED)
+    
     # 准备正样本（真实动作）
-    target_len = 2000  # 统一长度
+    target_len = TARGET_LENGTH
     X_action = np.array([resize_signal(normalize_signal(s), target_len) for s in segments])
     
     # 生成负样本（背景/噪声）
@@ -284,10 +297,10 @@ def train_pattern_detector(detector, segments, labels_amp, epochs=50, device='cp
     y_amp_encoded = le.fit_transform(labels_amp)
     y_amp_all = np.concatenate([y_amp_encoded, np.full(n_neg, -1)])
     
-    # 划分数据
-    indices = np.random.permutation(len(X_all))
-    split = int(0.8 * len(indices))
-    train_idx, val_idx = indices[:split], indices[split:]
+    # 使用 train_test_split 划分数据，确保可重复性
+    train_idx, val_idx = train_test_split(
+        np.arange(len(X_all)), test_size=0.2, random_state=RANDOM_SEED, stratify=y_action
+    )
     
     X_train, X_val = X_all[train_idx], X_all[val_idx]
     y_action_train, y_action_val = y_action[train_idx], y_action[val_idx]
@@ -460,13 +473,12 @@ def evaluate_classifiers(X_raw, X_feat, y, task_name, target_len):
     X_raw_resized = np.array([resize_signal(normalize_signal(s), target_len) for s in X_raw])
     
     X_raw_train, X_raw_test, y_train, y_test = train_test_split(
-        X_raw_resized, y_enc, test_size=0.2, random_state=42, stratify=y_enc
+        X_raw_resized, y_enc, test_size=0.2, random_state=RANDOM_SEED, stratify=y_enc
     )
-    X_feat_train, X_feat_test = X_feat[np.isin(y_enc, y_train)], X_feat[np.isin(y_enc, y_test)]
     
-    # 重新划分特征
+    # 使用相同的随机种子划分特征数据，确保一致性
     X_feat_train, X_feat_test, _, _ = train_test_split(
-        X_feat, y_enc, test_size=0.2, random_state=42, stratify=y_enc
+        X_feat, y_enc, test_size=0.2, random_state=RANDOM_SEED, stratify=y_enc
     )
     
     scaler = StandardScaler()
@@ -480,11 +492,11 @@ def evaluate_classifiers(X_raw, X_feat, y, task_name, target_len):
     # ML模型
     print("\n--- 机器学习模型 ---")
     ml_models = {
-        'RandomForest': RandomForestClassifier(n_estimators=100, max_depth=15, random_state=42),
-        'XGBoost': XGBClassifier(n_estimators=100, max_depth=6, random_state=42, verbosity=0),
-        'SVM': SVC(kernel='rbf', random_state=42),
+        'RandomForest': RandomForestClassifier(n_estimators=100, max_depth=15, random_state=RANDOM_SEED),
+        'XGBoost': XGBClassifier(n_estimators=100, max_depth=6, random_state=RANDOM_SEED, verbosity=0),
+        'SVM': SVC(kernel='rbf', random_state=RANDOM_SEED),
         'KNN': KNeighborsClassifier(n_neighbors=5),
-        'GradientBoosting': GradientBoostingClassifier(n_estimators=100, random_state=42)
+        'GradientBoosting': GradientBoostingClassifier(n_estimators=100, random_state=RANDOM_SEED)
     }
     
     for name, model in ml_models.items():
@@ -639,7 +651,6 @@ def main():
     print("="*60)
     
     TRAIN_DIR = 'train'
-    TARGET_LEN = 2000
     
     os.makedirs('models', exist_ok=True)
     os.makedirs('results', exist_ok=True)
@@ -667,7 +678,7 @@ def main():
     
     # 评估Amplitude分类
     print("\n[评估Amplitude分类器...]")
-    amp_eval = evaluate_classifiers(segments_filtered, features, labels_amp, "Amplitude", TARGET_LEN)
+    amp_eval = evaluate_classifiers(segments_filtered, features, labels_amp, "Amplitude", TARGET_LENGTH)
     plot_confusion_matrix(
         amp_eval['y_test'], amp_eval['results'][amp_eval['best']]['pred'],
         amp_eval['le'].classes_, f"Amplitude ({amp_eval['best']})", 'results/amplitude_confusion_matrix.png'
@@ -681,7 +692,7 @@ def main():
     feats_full = features[full_idx]
     labels_fat_full = [labels_fat[i] for i in full_idx]
     
-    fat_eval = evaluate_classifiers(segs_full, feats_full, labels_fat_full, "Fatigue", TARGET_LEN)
+    fat_eval = evaluate_classifiers(segs_full, feats_full, labels_fat_full, "Fatigue", TARGET_LENGTH)
     plot_confusion_matrix(
         fat_eval['y_test'], fat_eval['results'][fat_eval['best']]['pred'],
         fat_eval['le'].classes_, f"Fatigue ({fat_eval['best']})", 'results/fatigue_confusion_matrix.png'
@@ -707,7 +718,7 @@ def main():
     fat_le = fat_eval['le']
     fat_type = fat_eval['results'][fat_eval['best']]['type']
     
-    for i, raw_file in enumerate(raw_files[:5]):
+    for i, raw_file in enumerate(raw_files[:MAX_RAW_FILES]):
         print(f"\n处理: {os.path.basename(raw_file)}")
         signal = load_signal(raw_file)
         signal_filtered = bandpass_filter(signal)
@@ -732,7 +743,7 @@ def main():
                 feat_s = amp_scaler.transform(feat)
                 amp_pred = amp_model.predict(feat_s)[0]
             else:
-                seg_resized = resize_signal(normalize_signal(seg), TARGET_LEN)
+                seg_resized = resize_signal(normalize_signal(seg), TARGET_LENGTH)
                 x = torch.tensor(seg_resized, dtype=torch.float32).unsqueeze(0).to(device)
                 amp_model.eval()
                 with torch.no_grad():
@@ -745,7 +756,7 @@ def main():
                 feat_s = fat_scaler.transform(feat)
                 fat_pred = fat_model.predict(feat_s)[0]
             else:
-                seg_resized = resize_signal(normalize_signal(seg), TARGET_LEN)
+                seg_resized = resize_signal(normalize_signal(seg), TARGET_LENGTH)
                 x = torch.tensor(seg_resized, dtype=torch.float32).unsqueeze(0).to(device)
                 fat_model.eval()
                 with torch.no_grad():

@@ -1,456 +1,429 @@
 """
-Model wrappers for EMG signal classification.
-Provides interfaces for training and prediction with sklearn models.
+CNN+Transformer 深度学习模型用于 EMG 信号分类。
+使用 CNN 提取局部特征，Transformer 建模时序关系。
 """
 import numpy as np
-import pickle
-import warnings
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import LabelEncoder
-from xgboost import XGBClassifier
-
-
-class ActivityDetector:
-    """
-    Binary classifier to detect active/inactive segments in EMG signal.
-    Uses sliding window features to predict activity.
-    """
-    
-    def __init__(self, model_type='random_forest', decision_threshold=0.6, **kwargs):
-        """
-        Initialize activity detector.
-        
-        Args:
-            model_type: str, 'random_forest' or 'xgboost'
-            decision_threshold: float, probability threshold for classifying
-                                a window as active (0=inactive, 1=active).
-            **kwargs: additional parameters for the model
-        """
-        self.model_type = model_type
-        self.decision_threshold = decision_threshold
-        
-        if model_type == 'random_forest':
-            default_params = {
-                'n_estimators': 100,
-                'max_depth': 10,
-                'min_samples_split': 5,
-                'random_state': 42,
-                'n_jobs': -1,
-                'class_weight': 'balanced'
-            }
-            default_params.update(kwargs)
-            self.model = RandomForestClassifier(**default_params)
-        
-        elif model_type == 'xgboost':
-            default_params = {
-                'n_estimators': 100,
-                'max_depth': 6,
-                'learning_rate': 0.1,
-                'random_state': 42,
-                'n_jobs': -1
-            }
-            default_params.update(kwargs)
-            self.model = XGBClassifier(**default_params)
-        
-        else:
-            raise ValueError(f"Unknown model type: {model_type}")
-    
-    def fit(self, X, y):
-        """
-        Train the activity detector.
-        
-        Args:
-            X: np.array, feature matrix (n_samples, n_features)
-            y: np.array, binary labels (0=inactive, 1=active)
-        """
-        self.model.fit(X, y)
-    
-    def predict(self, X):
-        """
-        Predict activity for given features.
-        
-        Args:
-            X: np.array, feature matrix (n_samples, n_features)
-        
-        Returns:
-            np.array: binary predictions (0=inactive, 1=active)
-        """
-        proba = self.model.predict_proba(X)
-        
-        class_labels = None
-        active_idx = None
-        
-        if hasattr(self.model, "classes_"):
-            class_labels = np.array(self.model.classes_)
-            active_positions = np.where(class_labels == 1)[0]
-            if active_positions.size == 1:
-                active_idx = int(active_positions[0])
-            elif active_positions.size > 1:
-                warnings.warn(
-                    "Multiple occurrences of active class label '1' found; using the first.",
-                    RuntimeWarning,
-                )
-                active_idx = int(active_positions[0])
-            else:
-                warnings.warn(
-                    "Active class label '1' not found; falling back to the last probability column.",
-                    RuntimeWarning,
-                )
-        
-        if active_idx is None:
-            active_idx = proba.shape[1] - 1 if proba.shape[1] > 1 else 0
-        
-        if self.decision_threshold is None:
-            pred_indices = np.argmax(proba, axis=1)
-            if class_labels is not None:
-                predicted_labels = class_labels[pred_indices]
-                return (predicted_labels == 1).astype(int)
-            return pred_indices.astype(int)
-        
-        return (proba[:, active_idx] >= self.decision_threshold).astype(int)
-    
-    def predict_proba(self, X):
-        """
-        Predict probability of activity.
-        
-        Args:
-            X: np.array, feature matrix (n_samples, n_features)
-        
-        Returns:
-            np.array: probability matrix (n_samples, 2)
-        """
-        return self.model.predict_proba(X)
-    
-    def save(self, filepath):
-        """Save model to file."""
-        with open(filepath, 'wb') as f:
-            pickle.dump(self.model, f)
-        print(f"Model saved to {filepath}")
-    
-    def load(self, filepath):
-        """Load model from file."""
-        with open(filepath, 'rb') as f:
-            self.model = pickle.load(f)
-        print(f"Model loaded from {filepath}")
-
-
-class AmplitudeClassifier:
-    """
-    Multi-class classifier for amplitude classification (Full, Half, Invalid).
-    """
-    
-    def __init__(self, model_type='random_forest', **kwargs):
-        """
-        Initialize amplitude classifier.
-        
-        Args:
-            model_type: str, 'random_forest' or 'xgboost'
-            **kwargs: additional parameters for the model
-        """
-        self.model_type = model_type
-        self.label_encoder = LabelEncoder()
-        
-        if model_type == 'random_forest':
-            default_params = {
-                'n_estimators': 100,
-                'max_depth': 15,
-                'min_samples_split': 5,
-                'random_state': 42,
-                'n_jobs': -1,
-                'class_weight': 'balanced'
-            }
-            default_params.update(kwargs)
-            self.model = RandomForestClassifier(**default_params)
-        
-        elif model_type == 'xgboost':
-            default_params = {
-                'n_estimators': 100,
-                'max_depth': 6,
-                'learning_rate': 0.1,
-                'random_state': 42,
-                'n_jobs': -1
-            }
-            default_params.update(kwargs)
-            self.model = XGBClassifier(**default_params)
-        
-        else:
-            raise ValueError(f"Unknown model type: {model_type}")
-    
-    def fit(self, X, y):
-        """
-        Train the amplitude classifier.
-        
-        Args:
-            X: np.array, feature matrix (n_samples, n_features)
-            y: array-like, amplitude labels ('full', 'half', 'invalid')
-        """
-        y_encoded = self.label_encoder.fit_transform(y)
-        self.model.fit(X, y_encoded)
-    
-    def predict(self, X):
-        """
-        Predict amplitude class.
-        
-        Args:
-            X: np.array, feature matrix (n_samples, n_features)
-        
-        Returns:
-            np.array: amplitude predictions
-        """
-        y_encoded = self.model.predict(X)
-        return self.label_encoder.inverse_transform(y_encoded)
-    
-    def predict_proba(self, X):
-        """
-        Predict probability for each amplitude class.
-        
-        Args:
-            X: np.array, feature matrix (n_samples, n_features)
-        
-        Returns:
-            np.array: probability matrix (n_samples, n_classes)
-        """
-        return self.model.predict_proba(X)
-    
-    def get_classes(self):
-        """Get class labels."""
-        return self.label_encoder.classes_
-    
-    def save(self, filepath):
-        """Save model to file."""
-        with open(filepath, 'wb') as f:
-            pickle.dump({'model': self.model, 'label_encoder': self.label_encoder}, f)
-        print(f"Model saved to {filepath}")
-    
-    def load(self, filepath):
-        """Load model from file."""
-        with open(filepath, 'rb') as f:
-            data = pickle.load(f)
-            self.model = data['model']
-            self.label_encoder = data['label_encoder']
-        print(f"Model loaded from {filepath}")
-
-
-class FatigueClassifier:
-    """
-    Multi-class classifier for fatigue classification (Free, Light, Medium, Heavy).
-    Only applicable to 'full' amplitude data.
-    """
-    
-    def __init__(self, model_type='random_forest', **kwargs):
-        """
-        Initialize fatigue classifier.
-        
-        Args:
-            model_type: str, 'random_forest' or 'xgboost'
-            **kwargs: additional parameters for the model
-        """
-        self.model_type = model_type
-        self.label_encoder = LabelEncoder()
-        
-        if model_type == 'random_forest':
-            default_params = {
-                'n_estimators': 100,
-                'max_depth': 15,
-                'min_samples_split': 5,
-                'random_state': 42,
-                'n_jobs': -1,
-                'class_weight': 'balanced'
-            }
-            default_params.update(kwargs)
-            self.model = RandomForestClassifier(**default_params)
-        
-        elif model_type == 'xgboost':
-            default_params = {
-                'n_estimators': 100,
-                'max_depth': 6,
-                'learning_rate': 0.1,
-                'random_state': 42,
-                'n_jobs': -1
-            }
-            default_params.update(kwargs)
-            self.model = XGBClassifier(**default_params)
-        
-        else:
-            raise ValueError(f"Unknown model type: {model_type}")
-    
-    def fit(self, X, y):
-        """
-        Train the fatigue classifier.
-        
-        Args:
-            X: np.array, feature matrix (n_samples, n_features)
-            y: array-like, fatigue labels ('free', 'light', 'medium', 'heavy')
-        """
-        y_encoded = self.label_encoder.fit_transform(y)
-        self.model.fit(X, y_encoded)
-    
-    def predict(self, X):
-        """
-        Predict fatigue class.
-        
-        Args:
-            X: np.array, feature matrix (n_samples, n_features)
-        
-        Returns:
-            np.array: fatigue predictions
-        """
-        y_encoded = self.model.predict(X)
-        return self.label_encoder.inverse_transform(y_encoded)
-    
-    def predict_proba(self, X):
-        """
-        Predict probability for each fatigue class.
-        
-        Args:
-            X: np.array, feature matrix (n_samples, n_features)
-        
-        Returns:
-            np.array: probability matrix (n_samples, n_classes)
-        """
-        return self.model.predict_proba(X)
-    
-    def get_classes(self):
-        """Get class labels."""
-        return self.label_encoder.classes_
-    
-    def save(self, filepath):
-        """Save model to file."""
-        with open(filepath, 'wb') as f:
-            pickle.dump({'model': self.model, 'label_encoder': self.label_encoder}, f)
-        print(f"Model saved to {filepath}")
-    
-    def load(self, filepath):
-        """Load model from file."""
-        with open(filepath, 'rb') as f:
-            data = pickle.load(f)
-            self.model = data['model']
-            self.label_encoder = data['label_encoder']
-        print(f"Model loaded from {filepath}")
-
-
-# --- CRNN for three-state activity segmentation ---
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+import math
 
 
-class _CRNNBackbone(nn.Module):
-    def __init__(self, input_channels=1, conv_channels=32, lstm_hidden=64, num_classes=3):
+class PositionalEncoding(nn.Module):
+    """Transformer 位置编码"""
+    
+    def __init__(self, d_model, max_len=5000, dropout=0.1):
         super().__init__()
-        self.conv = nn.Conv1d(input_channels, conv_channels, kernel_size=5, padding=2)
-        self.relu = nn.ReLU(inplace=True)
-        self.bn = nn.BatchNorm1d(conv_channels)
-        self.dropout = nn.Dropout(0.2)
-        self.lstm = nn.LSTM(
-            input_size=conv_channels,
-            hidden_size=lstm_hidden,
-            num_layers=1,
-            batch_first=True,
-            bidirectional=True,
-        )
-        self.classifier = nn.Linear(lstm_hidden * 2, num_classes)
-
+        self.dropout = nn.Dropout(p=dropout)
+        
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
+        self.register_buffer('pe', pe)
+    
     def forward(self, x):
-        # x: (batch, seq_len) or (batch, 1, seq_len)
+        # x: (batch, seq_len, d_model)
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
+
+
+class CNNTransformerBackbone(nn.Module):
+    """
+    CNN + Transformer 骨干网络
+    - CNN: 提取局部时域特征
+    - Transformer: 建模全局时序关系
+    """
+    
+    def __init__(
+        self,
+        input_channels=1,
+        cnn_channels=[32, 64, 128],
+        kernel_sizes=[7, 5, 3],
+        d_model=128,
+        nhead=4,
+        num_transformer_layers=2,
+        dim_feedforward=256,
+        num_classes=3,
+        dropout=0.1
+    ):
+        super().__init__()
+        
+        # CNN 层：提取局部特征
+        cnn_layers = []
+        in_ch = input_channels
+        for out_ch, ks in zip(cnn_channels, kernel_sizes):
+            cnn_layers.extend([
+                nn.Conv1d(in_ch, out_ch, kernel_size=ks, padding=ks // 2),
+                nn.BatchNorm1d(out_ch),
+                nn.ReLU(inplace=True),
+                nn.MaxPool1d(kernel_size=2, stride=2),
+                nn.Dropout(dropout)
+            ])
+            in_ch = out_ch
+        self.cnn = nn.Sequential(*cnn_layers)
+        
+        # 投影到 Transformer 维度
+        self.proj = nn.Linear(cnn_channels[-1], d_model)
+        
+        # 位置编码
+        self.pos_encoder = PositionalEncoding(d_model, dropout=dropout)
+        
+        # Transformer Encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_transformer_layers)
+        
+        # 全局池化 + 分类头
+        self.classifier = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, num_classes)
+        )
+    
+    def forward(self, x):
+        # x: (batch, seq_len) 或 (batch, 1, seq_len)
         if x.dim() == 2:
-            x = x.unsqueeze(1)
-        x = self.conv(x)
-        x = self.bn(self.relu(x))
-        x = self.dropout(x)
-        x = x.transpose(1, 2)  # (batch, seq_len, channels)
-        x, _ = self.lstm(x)
-        logits = self.classifier(x)
+            x = x.unsqueeze(1)  # (batch, 1, seq_len)
+        
+        # CNN 特征提取
+        x = self.cnn(x)  # (batch, channels, seq_len')
+        
+        # 转换维度用于 Transformer
+        x = x.transpose(1, 2)  # (batch, seq_len', channels)
+        x = self.proj(x)  # (batch, seq_len', d_model)
+        
+        # 位置编码
+        x = self.pos_encoder(x)
+        
+        # Transformer 编码
+        x = self.transformer(x)  # (batch, seq_len', d_model)
+        
+        # 全局平均池化
+        x = x.mean(dim=1)  # (batch, d_model)
+        
+        # 分类
+        logits = self.classifier(x)  # (batch, num_classes)
+        
         return logits
 
 
-class CRNNActivitySegmenter:
+class CNNTransformerClassifier:
     """
-    Time-series semantic segmenter producing 0/1/2 labels per timestep.
+    CNN+Transformer EMG 信号分类器
+    用于识别动作类型 (amplitude) 和疲劳程度 (fatigue)
     """
-
+    
     def __init__(
         self,
-        sequence_length=400,
-        step_size=200,
-        conv_channels=32,
-        lstm_hidden=64,
-        num_classes=3,
-        device=None,
+        num_classes,
+        target_length=4000,
+        cnn_channels=[32, 64, 128],
+        kernel_sizes=[7, 5, 3],
+        d_model=128,
+        nhead=4,
+        num_transformer_layers=2,
+        dim_feedforward=256,
+        dropout=0.1,
+        device=None
     ):
-        self.sequence_length = sequence_length
-        self.step_size = step_size
-        self.conv_channels = conv_channels
-        self.lstm_hidden = lstm_hidden
-        self.num_classes = num_classes
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = _CRNNBackbone(
-            conv_channels=self.conv_channels,
-            lstm_hidden=self.lstm_hidden,
-            num_classes=self.num_classes,
-        ).to(self.device)
-
-    def fit(self, windows, labels, epochs=3, batch_size=32, lr=1e-3):
         """
-        Train CRNN using paired signal/label sequences.
+        初始化分类器
+        
         Args:
-            windows (np.array): shape (n_samples, seq_len)
-            labels (np.array): shape (n_samples, seq_len)
+            num_classes: 分类类别数
+            target_length: 目标序列长度（用于统一输入长度）
+            cnn_channels: CNN 各层通道数
+            kernel_sizes: CNN 各层卷积核大小
+            d_model: Transformer 模型维度
+            nhead: 注意力头数
+            num_transformer_layers: Transformer 层数
+            dim_feedforward: FFN 隐藏层维度
+            dropout: Dropout 概率
+            device: 计算设备
         """
-        x_tensor = torch.tensor(windows, dtype=torch.float32)
-        y_tensor = torch.tensor(labels, dtype=torch.long)
-        dataset = TensorDataset(x_tensor, y_tensor)
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
+        self.num_classes = num_classes
+        self.target_length = target_length
+        self.cnn_channels = cnn_channels
+        self.kernel_sizes = kernel_sizes
+        self.d_model = d_model
+        self.nhead = nhead
+        self.num_transformer_layers = num_transformer_layers
+        self.dim_feedforward = dim_feedforward
+        self.dropout = dropout
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        
+        self.model = CNNTransformerBackbone(
+            input_channels=1,
+            cnn_channels=cnn_channels,
+            kernel_sizes=kernel_sizes,
+            d_model=d_model,
+            nhead=nhead,
+            num_transformer_layers=num_transformer_layers,
+            dim_feedforward=dim_feedforward,
+            num_classes=num_classes,
+            dropout=dropout
+        ).to(self.device)
+        
+        self.label_to_idx = {}
+        self.idx_to_label = {}
+    
+    def _normalize_length(self, signals):
+        """
+        统一信号长度
+        - 过长则截取
+        - 过短则填充
+        """
+        normalized = []
+        for sig in signals:
+            if len(sig) > self.target_length:
+                # 截取中间部分
+                start = (len(sig) - self.target_length) // 2
+                normalized.append(sig[start:start + self.target_length])
+            elif len(sig) < self.target_length:
+                # 边缘填充
+                pad_total = self.target_length - len(sig)
+                pad_left = pad_total // 2
+                pad_right = pad_total - pad_left
+                normalized.append(np.pad(sig, (pad_left, pad_right), mode='edge'))
+            else:
+                normalized.append(sig)
+        return np.array(normalized)
+    
+    def _normalize_signal(self, signals):
+        """信号标准化"""
+        normalized = []
+        for sig in signals:
+            mean = np.mean(sig)
+            std = np.std(sig) + 1e-8
+            normalized.append((sig - mean) / std)
+        return np.array(normalized)
+    
+    def fit(self, signals, labels, epochs=50, batch_size=16, lr=1e-3, val_split=0.2):
+        """
+        训练模型
+        
+        Args:
+            signals: list of np.array, EMG 信号列表
+            labels: list of str, 标签列表
+            epochs: 训练轮数
+            batch_size: 批次大小
+            lr: 学习率
+            val_split: 验证集比例
+        """
+        # 构建标签映射
+        unique_labels = sorted(set(labels))
+        self.label_to_idx = {label: idx for idx, label in enumerate(unique_labels)}
+        self.idx_to_label = {idx: label for label, idx in self.label_to_idx.items()}
+        
+        # 预处理信号
+        signals = self._normalize_length(signals)
+        signals = self._normalize_signal(signals)
+        
+        # 转换标签
+        y = np.array([self.label_to_idx[label] for label in labels])
+        
+        # 划分训练集和验证集
+        n_val = int(len(signals) * val_split)
+        indices = np.random.permutation(len(signals))
+        val_indices = indices[:n_val]
+        train_indices = indices[n_val:]
+        
+        X_train = signals[train_indices]
+        y_train = y[train_indices]
+        X_val = signals[val_indices]
+        y_val = y[val_indices]
+        
+        # 创建数据加载器
+        train_dataset = TensorDataset(
+            torch.tensor(X_train, dtype=torch.float32),
+            torch.tensor(y_train, dtype=torch.long)
+        )
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        
+        val_dataset = TensorDataset(
+            torch.tensor(X_val, dtype=torch.float32),
+            torch.tensor(y_val, dtype=torch.long)
+        )
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+        
+        # 损失函数和优化器
         criterion = nn.CrossEntropyLoss()
-        optimizer = optim.Adam(self.model.parameters(), lr=lr)
-
-        self.model.train()
-        for _ in range(epochs):
-            for xb, yb in loader:
+        optimizer = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-4)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        
+        # 训练循环
+        best_val_acc = 0.0
+        best_state = None
+        
+        for epoch in range(epochs):
+            # 训练阶段
+            self.model.train()
+            train_loss = 0.0
+            train_correct = 0
+            train_total = 0
+            
+            for xb, yb in train_loader:
                 xb = xb.to(self.device)
                 yb = yb.to(self.device)
+                
                 optimizer.zero_grad()
                 logits = self.model(xb)
-                loss = criterion(logits.view(-1, 3), yb.view(-1))
+                loss = criterion(logits, yb)
                 loss.backward()
                 optimizer.step()
-
-    def predict(self, windows):
+                
+                train_loss += loss.item() * xb.size(0)
+                _, predicted = torch.max(logits, 1)
+                train_correct += (predicted == yb).sum().item()
+                train_total += xb.size(0)
+            
+            scheduler.step()
+            
+            train_acc = train_correct / train_total
+            avg_train_loss = train_loss / train_total
+            
+            # 验证阶段
+            self.model.eval()
+            val_correct = 0
+            val_total = 0
+            
+            with torch.no_grad():
+                for xb, yb in val_loader:
+                    xb = xb.to(self.device)
+                    yb = yb.to(self.device)
+                    
+                    logits = self.model(xb)
+                    _, predicted = torch.max(logits, 1)
+                    val_correct += (predicted == yb).sum().item()
+                    val_total += xb.size(0)
+            
+            val_acc = val_correct / val_total if val_total > 0 else 0.0
+            
+            # 保存最佳模型
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+            
+            if (epoch + 1) % 10 == 0 or epoch == 0:
+                print(f"Epoch {epoch + 1}/{epochs} - "
+                      f"Train Loss: {avg_train_loss:.4f}, Train Acc: {train_acc:.4f}, "
+                      f"Val Acc: {val_acc:.4f}")
+        
+        # 恢复最佳模型
+        if best_state is not None:
+            self.model.load_state_dict({k: v.to(self.device) for k, v in best_state.items()})
+        
+        print(f"\n训练完成! 最佳验证准确率: {best_val_acc:.4f}")
+        return best_val_acc
+    
+    def predict(self, signals):
         """
-        Predict per-timestep labels for given windows.
+        预测
+        
+        Args:
+            signals: list of np.array, EMG 信号列表
+        
+        Returns:
+            list of str: 预测标签
         """
         self.model.eval()
-        x_tensor = torch.tensor(windows, dtype=torch.float32).to(self.device)
+        
+        # 预处理
+        signals = self._normalize_length(signals)
+        signals = self._normalize_signal(signals)
+        
+        x_tensor = torch.tensor(signals, dtype=torch.float32).to(self.device)
+        
         with torch.no_grad():
             logits = self.model(x_tensor)
-            preds = torch.argmax(logits, dim=-1).cpu().numpy()
-        return preds
-
+            _, predicted = torch.max(logits, 1)
+            pred_indices = predicted.cpu().numpy()
+        
+        return [self.idx_to_label[idx] for idx in pred_indices]
+    
+    def predict_proba(self, signals):
+        """
+        预测概率
+        
+        Args:
+            signals: list of np.array, EMG 信号列表
+        
+        Returns:
+            np.array: 概率矩阵 (n_samples, n_classes)
+        """
+        self.model.eval()
+        
+        # 预处理
+        signals = self._normalize_length(signals)
+        signals = self._normalize_signal(signals)
+        
+        x_tensor = torch.tensor(signals, dtype=torch.float32).to(self.device)
+        
+        with torch.no_grad():
+            logits = self.model(x_tensor)
+            proba = torch.softmax(logits, dim=1).cpu().numpy()
+        
+        return proba
+    
+    def get_classes(self):
+        """获取类别标签列表"""
+        return [self.idx_to_label[i] for i in range(self.num_classes)]
+    
     def save(self, filepath):
-        torch.save(
-            {
-                "model_state_dict": self.model.state_dict(),
-                "sequence_length": self.sequence_length,
-                "step_size": self.step_size,
-                "conv_channels": self.conv_channels,
-                "lstm_hidden": self.lstm_hidden,
-                "num_classes": self.num_classes,
-            },
-            filepath,
-        )
-
+        """保存模型"""
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'num_classes': self.num_classes,
+            'target_length': self.target_length,
+            'cnn_channels': self.cnn_channels,
+            'kernel_sizes': self.kernel_sizes,
+            'd_model': self.d_model,
+            'nhead': self.nhead,
+            'num_transformer_layers': self.num_transformer_layers,
+            'dim_feedforward': self.dim_feedforward,
+            'dropout': self.dropout,
+            'label_to_idx': self.label_to_idx,
+            'idx_to_label': self.idx_to_label
+        }, filepath)
+        print(f"模型已保存到 {filepath}")
+    
     def load(self, filepath):
+        """加载模型"""
         checkpoint = torch.load(filepath, map_location=self.device)
-        self.sequence_length = checkpoint.get("sequence_length", self.sequence_length)
-        self.step_size = checkpoint.get("step_size", self.step_size)
-        self.conv_channels = checkpoint.get("conv_channels", self.conv_channels)
-        self.lstm_hidden = checkpoint.get("lstm_hidden", self.lstm_hidden)
-        self.num_classes = checkpoint.get("num_classes", self.num_classes)
-        self.model = _CRNNBackbone(
-            conv_channels=self.conv_channels,
-            lstm_hidden=self.lstm_hidden,
+        
+        self.num_classes = checkpoint['num_classes']
+        self.target_length = checkpoint['target_length']
+        self.cnn_channels = checkpoint['cnn_channels']
+        self.kernel_sizes = checkpoint['kernel_sizes']
+        self.d_model = checkpoint['d_model']
+        self.nhead = checkpoint['nhead']
+        self.num_transformer_layers = checkpoint['num_transformer_layers']
+        self.dim_feedforward = checkpoint['dim_feedforward']
+        self.dropout = checkpoint['dropout']
+        self.label_to_idx = checkpoint['label_to_idx']
+        self.idx_to_label = checkpoint['idx_to_label']
+        
+        self.model = CNNTransformerBackbone(
+            input_channels=1,
+            cnn_channels=self.cnn_channels,
+            kernel_sizes=self.kernel_sizes,
+            d_model=self.d_model,
+            nhead=self.nhead,
+            num_transformer_layers=self.num_transformer_layers,
+            dim_feedforward=self.dim_feedforward,
             num_classes=self.num_classes,
+            dropout=self.dropout
         ).to(self.device)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"模型已从 {filepath} 加载")

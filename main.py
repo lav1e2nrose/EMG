@@ -1,566 +1,793 @@
 """
-Main entry point for EMG signal analysis pipeline.
-Orchestrates data loading, preprocessing, feature extraction, training, and evaluation.
+EMG 信号动作模式学习与分割系统
+
+核心思路：
+1. 学习 segment 片段的动作模式（每种动作的特征模式）
+2. 用滑动窗口在原始信号中匹配动作模式
+3. 通过模式相似度检测动作边界，而不是简单的阈值
+4. 对检测到的动作进行amplitude和fatigue分类
+
+输出：混淆矩阵、分割信号图、评估报告
 """
 import os
-import sys
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split, StratifiedKFold
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.svm import SVC
+from sklearn.neighbors import KNeighborsClassifier
+from xgboost import XGBClassifier
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from scipy.signal import butter, filtfilt
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
 
-# Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+# 配置常量
+TARGET_LENGTH = 2000  # 统一信号长度
+RANDOM_SEED = 42      # 随机种子
+MAX_RAW_FILES = 5     # 处理原始文件数量限制
+PE_SCALE = 10000.0    # 位置编码缩放因子
 
-from preprocessing import (
-    load_emg_data, preprocess_signal, create_sliding_windows,
-    label_windows_from_segments, improved_get_segment_ranges,
-    detect_activity_segments, label_signal_three_state,
-    create_sequence_windows_for_segmentation, decode_three_state_predictions,
-    segment_signal_improved, detect_activity_regions
-)
-from features import extract_features_from_windows, extract_segment_features
-from models import ActivityDetector, AmplitudeClassifier, FatigueClassifier, CRNNActivitySegmenter
-from utils import (
-    parse_filename, get_train_files, load_segments_metadata,
-    plot_confusion_matrix, print_classification_report
-)
+# 字体配置
+try:
+    plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'sans-serif']
+except Exception:
+    pass
+plt.rcParams['axes.unicode_minus'] = False
 
 
-def train_activity_detector(train_dir, window_size=200, step_size=100, 
-                            model_type='random_forest'):
-    """
-    Train activity detector using raw files and manual segments.
+# ==================== 数据加载 ====================
+
+def load_signal(filepath):
+    """加载信号"""
+    data = pd.read_csv(filepath, header=None)
+    return data.values.astype(float).flatten()
+
+
+def parse_filename(filename):
+    """解析文件名"""
+    basename = os.path.basename(filename).replace('.csv', '')
+    parts = basename.split('_')
+    if len(parts) >= 4:
+        return {'amplitude': parts[0], 'fatigue': parts[1], 'subject': parts[2]}
+    return None
+
+
+def load_all_segments(train_dir):
+    """加载所有segment"""
+    segments, labels_amp, labels_fat, subjects = [], [], [], []
     
-    Args:
-        train_dir: str, path to training directory
-        window_size: int, window size in samples (200 samples = 0.1s at 2000Hz)
-        step_size: int, step size in samples
-        model_type: str, 'random_forest' or 'xgboost'
+    for item in os.listdir(train_dir):
+        item_path = os.path.join(train_dir, item)
+        if os.path.isdir(item_path) and item.endswith('_segments'):
+            for seg_file in sorted(os.listdir(item_path)):
+                if seg_file.endswith('.csv'):
+                    seg_path = os.path.join(item_path, seg_file)
+                    meta = parse_filename(seg_file)
+                    if meta:
+                        signal = load_signal(seg_path)
+                        segments.append(signal)
+                        labels_amp.append(meta['amplitude'])
+                        labels_fat.append(meta['fatigue'])
+                        subjects.append(meta['subject'])
     
-    Returns:
-        ActivityDetector: trained model
-    """
-    print("\n=== Training Activity Detector ===")
+    print(f"加载 {len(segments)} 个 segment")
+    print(f"Amplitude: {pd.Series(labels_amp).value_counts().to_dict()}")
+    print(f"Fatigue: {pd.Series(labels_fat).value_counts().to_dict()}")
+    return segments, labels_amp, labels_fat, subjects
+
+
+def get_raw_files(train_dir):
+    """获取原始信号文件"""
+    raw_files = []
+    for item in os.listdir(train_dir):
+        if item.endswith('.csv') and '_seg' not in item:
+            item_path = os.path.join(train_dir, item)
+            if os.path.isfile(item_path):
+                raw_files.append(item_path)
+    return sorted(raw_files)
+
+
+# ==================== 信号处理 ====================
+
+def bandpass_filter(signal, fs=2000, lowcut=20, highcut=450):
+    """带通滤波"""
+    nyq = fs / 2
+    b, a = butter(4, [lowcut/nyq, highcut/nyq], btype='band')
+    return filtfilt(b, a, signal)
+
+
+def normalize_signal(signal):
+    """标准化"""
+    return (signal - np.mean(signal)) / (np.std(signal) + 1e-8)
+
+
+def resize_signal(signal, target_length):
+    """调整信号长度（插值或截取）"""
+    if len(signal) == target_length:
+        return signal
+    x_old = np.linspace(0, 1, len(signal))
+    x_new = np.linspace(0, 1, target_length)
+    return np.interp(x_new, x_old, signal)
+
+
+# ==================== 特征提取 ====================
+
+def extract_features(signal):
+    """提取特征向量"""
+    feats = []
     
-    # Get training files
-    file_data = get_train_files(train_dir)
+    # 时域
+    feats.append(np.sqrt(np.mean(signal**2)))  # RMS
+    feats.append(np.mean(np.abs(signal)))  # MAV
+    feats.append(np.var(signal))  # VAR
+    feats.append(np.max(signal) - np.min(signal))  # Peak-to-peak
+    feats.append(np.sum(np.abs(np.diff(np.sign(signal))) > 0))  # ZC
+    feats.append(np.sum(np.abs(np.diff(signal))))  # WL
     
-    X_all = []
-    y_all = []
+    # 频域
+    fft = np.fft.rfft(signal)
+    freqs = np.fft.rfftfreq(len(signal), 1/2000)
+    power = np.abs(fft)**2
+    feats.append(np.sum(freqs * power) / (np.sum(power) + 1e-10))  # Mean freq
     
-    # Process files with manual segments
-    for raw_file, segment_dir in file_data['segment_dirs'].items():
-        print(f"Processing {os.path.basename(raw_file)}...")
-        
-        # Load and preprocess raw signal
-        raw_signal = load_emg_data(raw_file)
-        filtered_signal = preprocess_signal(raw_signal)
-        
-        # Get segment ranges
-        segment_ranges = improved_get_segment_ranges(raw_file, segment_dir)
-        
-        if len(segment_ranges) == 0:
-            print(f"  Warning: No segments found for {raw_file}")
-            continue
-        
-        # Create sliding windows
-        windows, start_indices = create_sliding_windows(
-            filtered_signal, window_size, step_size
+    # 分段特征（将信号分成4段，每段提取RMS）
+    n_parts = 4
+    part_len = len(signal) // n_parts
+    for i in range(n_parts):
+        part = signal[i*part_len:(i+1)*part_len]
+        feats.append(np.sqrt(np.mean(part**2)))
+    
+    return np.array(feats)
+
+
+def extract_all_features(signals):
+    """批量提取特征"""
+    return np.array([extract_features(s) for s in signals])
+
+
+# ==================== 深度学习模型 ====================
+
+class CNNClassifier(nn.Module):
+    """CNN分类器"""
+    def __init__(self, num_classes):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(1, 32, 7, padding=3), nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(4),
+            nn.Conv1d(32, 64, 5, padding=2), nn.BatchNorm1d(64), nn.ReLU(), nn.MaxPool1d(4),
+            nn.Conv1d(64, 128, 3, padding=1), nn.BatchNorm1d(128), nn.ReLU(), nn.AdaptiveAvgPool1d(1)
         )
-        
-        # Label windows
-        labels, _ = label_windows_from_segments(
-            len(filtered_signal), segment_ranges, window_size, step_size
+        self.fc = nn.Sequential(nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.3), nn.Linear(64, num_classes))
+    
+    def forward(self, x):
+        if x.dim() == 2: x = x.unsqueeze(1)
+        return self.fc(self.conv(x).squeeze(-1))
+
+
+class CNNTransformer(nn.Module):
+    """CNN + Transformer"""
+    def __init__(self, num_classes, d_model=64):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(1, 32, 7, padding=3), nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(4),
+            nn.Conv1d(32, d_model, 5, padding=2), nn.BatchNorm1d(d_model), nn.ReLU(), nn.MaxPool1d(4)
         )
-        
-        # Extract features
-        features, feature_names = extract_features_from_windows(windows)
-        
-        print(f"  Windows: {len(windows)}, Active: {np.sum(labels)}, "
-              f"Inactive: {len(labels) - np.sum(labels)}")
-        
-        X_all.append(features)
-        y_all.append(labels)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=4, dim_feedforward=128, dropout=0.1, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        self.fc = nn.Sequential(nn.Linear(d_model, 32), nn.ReLU(), nn.Dropout(0.3), nn.Linear(32, num_classes))
     
-    # Combine all data
-    X = np.vstack(X_all)
-    y = np.hstack(y_all)
+    def forward(self, x):
+        if x.dim() == 2: x = x.unsqueeze(1)
+        x = self.conv(x).transpose(1, 2)
+        return self.fc(self.transformer(x).mean(dim=1))
+
+
+class ActionPatternDetector(nn.Module):
+    """
+    动作模式检测器
+    学习每种动作的模式，输出：
+    1. 是否是有效动作 (action vs background)
+    2. 动作类型 (amplitude)
+    """
+    def __init__(self, num_amp_classes=3):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(1, 32, 7, padding=3), nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(4),
+            nn.Conv1d(32, 64, 5, padding=2), nn.BatchNorm1d(64), nn.ReLU(), nn.MaxPool1d(4),
+            nn.Conv1d(64, 128, 3, padding=1), nn.BatchNorm1d(128), nn.ReLU(), nn.AdaptiveAvgPool1d(1)
+        )
+        self.fc_shared = nn.Sequential(nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.3))
+        # 动作检测头：是否是有效动作
+        self.fc_action = nn.Linear(64, 2)  # [background, action]
+        # 动作分类头：amplitude类型
+        self.fc_amp = nn.Linear(64, num_amp_classes)
     
-    print(f"\nTotal samples: {len(y)}")
-    print(f"Active: {np.sum(y)} ({100*np.sum(y)/len(y):.1f}%)")
-    print(f"Inactive: {len(y) - np.sum(y)} ({100*(len(y)-np.sum(y))/len(y):.1f}%)")
+    def forward(self, x):
+        if x.dim() == 2: x = x.unsqueeze(1)
+        feat = self.fc_shared(self.conv(x).squeeze(-1))
+        return self.fc_action(feat), self.fc_amp(feat)
     
-    # Split data
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
+    def get_features(self, x):
+        """获取特征向量，用于模式匹配"""
+        if x.dim() == 2: x = x.unsqueeze(1)
+        return self.fc_shared(self.conv(x).squeeze(-1))
+
+
+# ==================== 模型训练 ====================
+
+def train_model(model, X_train, y_train, X_val, y_val, epochs=50, lr=1e-3, device='cpu'):
+    """训练模型"""
+    model = model.to(device)
+    train_loader = DataLoader(TensorDataset(
+        torch.tensor(X_train, dtype=torch.float32),
+        torch.tensor(y_train, dtype=torch.long)
+    ), batch_size=16, shuffle=True)
+    val_loader = DataLoader(TensorDataset(
+        torch.tensor(X_val, dtype=torch.float32),
+        torch.tensor(y_val, dtype=torch.long)
+    ), batch_size=16)
+    
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    
+    best_acc, best_state = 0, None
+    for _ in range(epochs):
+        model.train()
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(xb), yb)
+            loss.backward()
+            optimizer.step()
+        
+        model.eval()
+        correct, total = 0, 0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb, yb = xb.to(device), yb.to(device)
+                _, pred = torch.max(model(xb), 1)
+                correct += (pred == yb).sum().item()
+                total += yb.size(0)
+        acc = correct / total
+        if acc > best_acc:
+            best_acc = acc
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+    
+    if best_state:
+        model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+    return model, best_acc
+
+
+def train_pattern_detector(detector, segments, labels_amp, epochs=50, device='cpu'):
+    """
+    训练动作模式检测器
+    - 学习动作模式（正样本：真实动作）
+    - 学习背景模式（负样本：随机噪声/静止段）
+    """
+    # 设置随机种子确保可重复性
+    np.random.seed(RANDOM_SEED)
+    
+    # 准备正样本（真实动作）
+    target_len = TARGET_LENGTH
+    X_action = np.array([resize_signal(normalize_signal(s), target_len) for s in segments])
+    
+    # 生成负样本（背景/噪声）
+    n_neg = len(segments)
+    X_background = []
+    for _ in range(n_neg):
+        # 生成低幅度噪声作为背景
+        noise = np.random.randn(target_len) * 0.1
+        X_background.append(noise)
+    X_background = np.array(X_background)
+    
+    # 合并数据
+    X_all = np.vstack([X_action, X_background])
+    y_action = np.array([1] * len(X_action) + [0] * len(X_background))  # 1=action, 0=background
+    
+    # amplitude标签（背景设为-1，训练时忽略）
+    le = LabelEncoder()
+    y_amp_encoded = le.fit_transform(labels_amp)
+    y_amp_all = np.concatenate([y_amp_encoded, np.full(n_neg, -1)])
+    
+    # 使用 train_test_split 划分数据，确保可重复性
+    train_idx, val_idx = train_test_split(
+        np.arange(len(X_all)), test_size=0.2, random_state=RANDOM_SEED, stratify=y_action
     )
     
-    # Train model
-    print(f"\nTraining {model_type} model...")
-    # Lower threshold (0.4) for better recall on activity detection
-    detector = ActivityDetector(model_type=model_type, decision_threshold=0.4)
-    detector.fit(X_train, y_train)
+    X_train, X_val = X_all[train_idx], X_all[val_idx]
+    y_action_train, y_action_val = y_action[train_idx], y_action[val_idx]
+    y_amp_train, y_amp_val = y_amp_all[train_idx], y_amp_all[val_idx]
     
-    # Evaluate
-    y_pred = detector.predict(X_test)
-    accuracy = accuracy_score(y_test, y_pred)
+    # 训练
+    detector = detector.to(device)
+    train_loader = DataLoader(TensorDataset(
+        torch.tensor(X_train, dtype=torch.float32),
+        torch.tensor(y_action_train, dtype=torch.long),
+        torch.tensor(y_amp_train, dtype=torch.long)
+    ), batch_size=16, shuffle=True)
     
-    print(f"\nActivity Detector Accuracy: {accuracy:.4f}")
-    print("\nClassification Report:")
-    print(classification_report(y_test, y_pred, target_names=['Inactive', 'Active']))
+    criterion_action = nn.CrossEntropyLoss()
+    criterion_amp = nn.CrossEntropyLoss(ignore_index=-1)
+    optimizer = optim.AdamW(detector.parameters(), lr=1e-3, weight_decay=1e-4)
     
-    return detector
+    for epoch in range(epochs):
+        detector.train()
+        for xb, yb_action, yb_amp in train_loader:
+            xb = xb.to(device)
+            yb_action = yb_action.to(device)
+            yb_amp = yb_amp.to(device)
+            
+            optimizer.zero_grad()
+            out_action, out_amp = detector(xb)
+            loss = criterion_action(out_action, yb_action) + criterion_amp(out_amp, yb_amp)
+            loss.backward()
+            optimizer.step()
+    
+    # 验证
+    detector.eval()
+    with torch.no_grad():
+        x_val_tensor = torch.tensor(X_val, dtype=torch.float32).to(device)
+        out_action, _ = detector(x_val_tensor)
+        _, pred = torch.max(out_action, 1)
+        acc = (pred.cpu().numpy() == y_action_val).mean()
+        print(f"动作检测验证准确率: {acc:.4f}")
+    
+    return detector, le, target_len
 
 
-def train_crnn_activity_segmenter(train_dir, sequence_length=400, step_size=200, epochs=3):
+# ==================== 动作模式分割 ====================
+
+def detect_actions_with_pattern(detector, signal, target_len, window_step=500, 
+                                threshold=0.7, min_gap=1000, device='cpu'):
     """
-    Train CRNN-based three-state activity segmenter.
-    """
-    print("\n=== Training CRNN Activity Segmenter ===")
-
-    file_data = get_train_files(train_dir)
-    window_buffer = []
-    label_buffer = []
-
-    for raw_file, segment_dir in file_data['segment_dirs'].items():
-        print(f"Processing {os.path.basename(raw_file)} for CRNN...")
-        raw_signal = load_emg_data(raw_file)
-        filtered_signal = preprocess_signal(raw_signal)
-        segment_ranges = improved_get_segment_ranges(raw_file, segment_dir)
-
-        if len(segment_ranges) == 0:
-            print(f"  Warning: No segments found for {raw_file}")
-            continue
-
-        per_sample_labels = label_signal_three_state(len(filtered_signal), segment_ranges)
-        windows, label_windows = create_sequence_windows_for_segmentation(
-            filtered_signal, per_sample_labels, sequence_length, step_size
-        )
-
-        window_buffer.append(windows)
-        label_buffer.append(label_windows)
-
-    if not window_buffer:
-        raise RuntimeError("No data available for CRNN training.")
-
-    X = np.vstack(window_buffer)
-    y = np.vstack(label_buffer)
-
-    print(f"CRNN training samples: {len(X)}, sequence length: {sequence_length}")
-
-    segmenter = CRNNActivitySegmenter(sequence_length=sequence_length, step_size=step_size)
-    segmenter.fit(X, y, epochs=epochs)
-    return segmenter
-
-
-def segment_signal_with_crnn(signal, segmenter):
-    """
-    Predict three-state labels and convert to segments.
-    """
-    seq_len = segmenter.sequence_length
-    step = segmenter.step_size
-
-    # Pad the tail so that the final window is complete
-    signal_length = len(signal)
-    if signal_length < seq_len:
-        pad_length = seq_len - signal_length
-    else:
-        remainder = (signal_length - seq_len) % step
-        pad_length = 0 if remainder == 0 else step - remainder
-
-    if pad_length > 0:
-        signal = np.pad(signal, (0, pad_length), mode="edge")
-
-    dummy_labels = np.zeros(len(signal), dtype=int)
-    windows, _ = create_sequence_windows_for_segmentation(signal, dummy_labels, seq_len, step)
-    preds = segmenter.predict(windows)
-    # Reconstruct per-sample predictions by overlap-averaging (simple majority)
-    per_sample = np.zeros(len(signal), dtype=int)
-    counts = np.zeros(len(signal), dtype=int)
-    for i, start in enumerate(range(0, len(signal) - seq_len + 1, step)):
-        per_sample[start:start + seq_len] += preds[i]
-        counts[start:start + seq_len] += 1
-    counts[counts == 0] = 1
-    per_sample = (per_sample / counts).round().astype(int)
-    per_sample = np.clip(per_sample, 0, 2)
-    return decode_three_state_predictions(per_sample)
-
-
-def segment_signal_with_detector(signal, detector, window_size=200, step_size=100):
-    """
-    Segment a signal using trained activity detector.
+    使用学习到的动作模式检测信号中的动作
     
-    Args:
-        signal: array-like, preprocessed signal
-        detector: ActivityDetector, trained detector
-        window_size: int, window size in samples
-        step_size: int, step size in samples
+    原理：
+    1. 滑动窗口扫描信号
+    2. 用训练好的检测器判断每个窗口是否包含动作
+    3. 根据动作概率找到动作位置
+    4. 合并重叠检测，精确定位边界
     
-    Returns:
-        list: list of tuples (start, end) for detected segments
+    返回：segments 列表，不包含 amplitude 预测（由分类器单独预测）
     """
-    # Create sliding windows
-    windows, start_indices = create_sliding_windows(signal, window_size, step_size)
+    signal_norm = normalize_signal(signal)
+    detector.eval()
     
-    # Extract features
-    features, _ = extract_features_from_windows(windows)
+    # 滑动窗口检测
+    detections = []  # [(center_pos, action_prob, start, end)]
     
-    # Predict activity
-    predictions = detector.predict(features)
+    for start in range(0, len(signal) - target_len + 1, window_step):
+        window = signal_norm[start:start + target_len]
+        x = torch.tensor(window, dtype=torch.float32).unsqueeze(0).to(device)
+        
+        with torch.no_grad():
+            out_action, _ = detector(x)
+            action_prob = torch.softmax(out_action, dim=1)[0, 1].item()  # P(action)
+        
+        center = start + target_len // 2
+        detections.append((center, action_prob, start, start + target_len))
     
-    # Convert predictions to segments
-    segments = detect_activity_segments(predictions, start_indices)
+    # 找到高置信度的检测
+    high_conf = [(c, p, s, e) for c, p, s, e in detections if p > threshold]
+    
+    if not high_conf:
+        # 降低阈值再试
+        threshold = max(0.5, threshold - 0.2)
+        high_conf = [(c, p, s, e) for c, p, s, e in detections if p > threshold]
+    
+    if not high_conf:
+        return []
+    
+    # 非极大值抑制：合并重叠的检测
+    high_conf = sorted(high_conf, key=lambda x: -x[1])  # 按概率降序
+    segments = []
+    
+    for center, prob, start, end in high_conf:
+        # 检查是否与已有segment重叠
+        overlap = False
+        for seg_start, seg_end in segments:
+            if not (end < seg_start or start > seg_end):
+                overlap = True
+                break
+        
+        if not overlap:
+            # 精确化边界：在检测区域内找能量变化点
+            refined_start, refined_end = refine_segment_boundaries(
+                signal_norm, start, end, target_len
+            )
+            segments.append((refined_start, refined_end))
+    
+    # 按时间顺序排序
+    segments = sorted(segments, key=lambda x: x[0])
     
     return segments
 
 
-def segment_signal_rms_based(signal, fs=2000, rms_window_ms=50, 
-                             min_segment_ms=500, merge_gap_ms=300,
-                             use_dual_threshold=True):
+def refine_segment_boundaries(signal, approx_start, approx_end, target_len):
     """
-    Segment a signal using improved RMS-based detection.
-    This is the recommended method for better segmentation quality.
-    
-    Uses:
-    1. RMS envelope for amplitude detection
-    2. Adaptive (Otsu) thresholding
-    3. Dual-threshold hysteresis for stable boundaries
-    4. Minimum segment length filtering
-    5. Close segment merging
-    
-    Args:
-        signal: array-like, preprocessed signal
-        fs: int, sampling rate in Hz
-        rms_window_ms: int, RMS window size in ms
-        min_segment_ms: int, minimum segment duration in ms
-        merge_gap_ms: int, merge segments closer than this in ms
-        use_dual_threshold: bool, use hysteresis thresholding
-    
-    Returns:
-        list: list of tuples (start, end) for detected segments
+    精确化segment边界
+    在检测到的大致区域内，根据信号能量变化精确找到动作的起止点
     """
-    return segment_signal_improved(
-        signal, fs=fs, 
-        rms_window_ms=rms_window_ms,
-        min_segment_ms=min_segment_ms,
-        merge_gap_ms=merge_gap_ms,
-        use_dual_threshold=use_dual_threshold
-    )
+    # 扩展搜索范围
+    search_margin = target_len // 4
+    search_start = max(0, approx_start - search_margin)
+    search_end = min(len(signal), approx_end + search_margin)
+    
+    segment = signal[search_start:search_end]
+    
+    # 计算能量包络
+    window_size = 100
+    energy = np.array([np.mean(segment[max(0,i-window_size//2):min(len(segment),i+window_size//2)]**2) 
+                       for i in range(len(segment))])
+    
+    # 找能量阈值
+    threshold = np.mean(energy) + 0.5 * np.std(energy)
+    
+    # 找起点（从左往右第一个超过阈值的点）
+    above = energy > threshold
+    start_idx = 0
+    for i, v in enumerate(above):
+        if v:
+            start_idx = i
+            break
+    
+    # 找终点（从右往左第一个超过阈值的点）
+    end_idx = len(segment) - 1
+    for i in range(len(above) - 1, -1, -1):
+        if above[i]:
+            end_idx = i
+            break
+    
+    refined_start = search_start + start_idx
+    refined_end = search_start + end_idx
+    
+    # 确保合理长度
+    min_len = target_len // 4
+    if refined_end - refined_start < min_len:
+        refined_start = approx_start
+        refined_end = approx_end
+    
+    return refined_start, refined_end
 
 
-def train_classifiers(train_dir, model_type='random_forest', 
-                     filter_amplitude_by_fatigue=True, filter_fatigue_by_amplitude=True,
-                     n_folds=5):
-    """
-    Train amplitude and fatigue classifiers using segmented data with k-fold cross-validation.
-    
-    Args:
-        train_dir: str, path to training directory
-        model_type: str, 'random_forest' or 'xgboost'
-        filter_amplitude_by_fatigue: bool, if True, use only 'free' fatigue for amplitude training
-                                     (Default: True - amplitude classes only apply to 'free' state)
-        filter_fatigue_by_amplitude: bool, if True, use only 'full' amplitude for fatigue training
-                                     (Default: True - fatigue only applies to 'full' amplitude)
-        n_folds: int, number of folds for cross-validation (default: 5)
-    
-    Returns:
-        tuple: (AmplitudeClassifier, FatigueClassifier)
-    """
-    print("\n=== Training Classifiers with K-Fold Cross-Validation ===")
-    
-    # Collect all segment data
-    segments_data = []
-    
-    file_data = get_train_files(train_dir)
-    
-    print("\n--- Loading Segment Data ---")
-    for raw_file, segment_dir in file_data['segment_dirs'].items():
-        print(f"Loading segments from {os.path.basename(segment_dir)}...")
-        
-        segments = load_segments_metadata(segment_dir)
-        
-        for seg_meta in segments:
-            # Load segment signal
-            seg_signal = load_emg_data(seg_meta['path'])
-            seg_filtered = preprocess_signal(seg_signal)
-            
-            # Extract features
-            features = extract_segment_features(seg_filtered)
-            
-            # Store data
-            seg_meta['features'] = features
-            segments_data.append(seg_meta)
-    
-    print(f"\nTotal segments loaded: {len(segments_data)}")
-    
-    # Print detailed statistics
-    print("\n--- Training Data Statistics ---")
-    print(f"Total training actions (CSV files): {len(file_data['segment_dirs'])}")
-    
-    # Count by amplitude
-    amplitude_counts = {}
-    fatigue_counts = {}
-    subject_counts = {}
-    
-    for seg in segments_data:
-        amp = seg['amplitude']
-        fat = seg['fatigue']
-        subj = seg['subject_id']
-        
-        amplitude_counts[amp] = amplitude_counts.get(amp, 0) + 1
-        fatigue_counts[fat] = fatigue_counts.get(fat, 0) + 1
-        subject_counts[subj] = subject_counts.get(subj, 0) + 1
-    
-    print("\nAmplitude Distribution:")
-    for amp in sorted(amplitude_counts.keys()):
-        print(f"  {amp}: {amplitude_counts[amp]} samples")
-    
-    print("\nFatigue Distribution:")
-    for fat in sorted(fatigue_counts.keys()):
-        print(f"  {fat}: {fatigue_counts[fat]} samples")
-    
-    print("\nSubject Distribution:")
-    for subj in sorted(subject_counts.keys()):
-        print(f"  Subject {subj}: {subject_counts[subj]} samples")
-    
-    # Prepare data for amplitude classification
-    # IMPORTANT: Amplitude classification (full/half/invalid) only applies to 'free' fatigue state
-    X_amp = []
-    y_amp = []
-    subj_amp = []
-    
-    for seg in segments_data:
-        if seg['features'] is not None:
-            # Apply filtering: amplitude classes only apply when fatigue is 'free'
-            if filter_amplitude_by_fatigue and seg['fatigue'] != 'free':
-                continue
-            
-            feature_values = list(seg['features'].values())
-            X_amp.append(feature_values)
-            y_amp.append(seg['amplitude'])
-            subj_amp.append(seg['subject_id'])
-    
-    X_amp = np.array(X_amp)
-    y_amp = np.array(y_amp)
-    subj_amp = np.array(subj_amp)
-    
-    # Train amplitude classifier with k-fold cross-validation
-    print("\n--- Training Amplitude Classifier with K-Fold CV ---")
-    if filter_amplitude_by_fatigue:
-        print("Using filtered data: only 'free' fatigue samples (amplitude classification only applies to 'free' state)")
-    print(f"Total samples: {len(y_amp)}")
-    unique_classes, class_counts = np.unique(y_amp, return_counts=True)
-    print(f"Samples per amplitude class:")
-    for cls, count in zip(unique_classes, class_counts):
-        print(f"  {cls}: {count} samples")
-    print(f"Using {n_folds}-fold cross-validation")
-    
-    # K-fold cross-validation for amplitude classifier
-    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
-    
-    all_y_amp_true = []
-    all_y_amp_pred = []
-    amp_fold_accuracies = []
-    
-    for fold, (train_idx, test_idx) in enumerate(skf.split(X_amp, y_amp)):
-        X_train, X_test = X_amp[train_idx], X_amp[test_idx]
-        y_train, y_test = y_amp[train_idx], y_amp[test_idx]
-        
-        # Train model for this fold
-        fold_classifier = AmplitudeClassifier(model_type=model_type)
-        fold_classifier.fit(X_train, y_train)
-        
-        # Predict
-        y_pred = fold_classifier.predict(X_test)
-        
-        # Collect predictions
-        all_y_amp_true.extend(y_test)
-        all_y_amp_pred.extend(y_pred)
-        
-        fold_acc = accuracy_score(y_test, y_pred)
-        amp_fold_accuracies.append(fold_acc)
-        print(f"  Fold {fold+1}: Accuracy = {fold_acc:.4f}")
-    
-    # Train final model on all data
-    amp_classifier = AmplitudeClassifier(model_type=model_type)
-    amp_classifier.fit(X_amp, y_amp)
-    
-    # Compute overall metrics from cross-validation
-    all_y_amp_true = np.array(all_y_amp_true)
-    all_y_amp_pred = np.array(all_y_amp_pred)
-    
-    amp_accuracy = accuracy_score(all_y_amp_true, all_y_amp_pred)
-    print(f"\nAmplitude Classifier CV Accuracy: {amp_accuracy:.4f} (+/- {np.std(amp_fold_accuracies):.4f})")
-    print("\nClassification Report (aggregated from all folds):")
-    print_classification_report(
-        all_y_amp_true, all_y_amp_pred,
-        labels=amp_classifier.get_classes(),
-        target_names=amp_classifier.get_classes()
-    )
-    
-    # Plot confusion matrix with aggregated predictions from all folds
-    plot_confusion_matrix(
-        all_y_amp_true, all_y_amp_pred,
-        labels=amp_classifier.get_classes(),
-        title=f'Amplitude Classification Confusion Matrix ({n_folds}-Fold CV)',
-        save_path='amplitude_confusion_matrix.png'
-    )
-    
-    # Prepare data for fatigue classification (only 'full' amplitude)
-    # IMPORTANT: Fatigue classification only applies to 'full' amplitude samples
-    X_fat = []
-    y_fat = []
-    subj_fat = []
-    
-    for seg in segments_data:
-        if seg['features'] is not None:
-            # Fatigue classification only applies to 'full' amplitude
-            if filter_fatigue_by_amplitude and seg['amplitude'] != 'full':
-                continue
-            
-            feature_values = list(seg['features'].values())
-            X_fat.append(feature_values)
-            y_fat.append(seg['fatigue'])
-            subj_fat.append(seg['subject_id'])
-    
-    X_fat = np.array(X_fat)
-    y_fat = np.array(y_fat)
-    subj_fat = np.array(subj_fat)
-    
-    # Train fatigue classifier with k-fold cross-validation
-    print("\n--- Training Fatigue Classifier with K-Fold CV ---")
-    print("Using only 'full' amplitude samples (fatigue classification only applies to 'full' amplitude)")
-    print(f"Total samples: {len(y_fat)}")
-    unique_classes, class_counts = np.unique(y_fat, return_counts=True)
-    print(f"Samples per fatigue class:")
-    for cls, count in zip(unique_classes, class_counts):
-        print(f"  {cls}: {count} samples")
-    print(f"Using {n_folds}-fold cross-validation")
-    
-    # K-fold cross-validation for fatigue classifier
-    all_y_fat_true = []
-    all_y_fat_pred = []
-    fat_fold_accuracies = []
-    
-    for fold, (train_idx, test_idx) in enumerate(skf.split(X_fat, y_fat)):
-        X_train, X_test = X_fat[train_idx], X_fat[test_idx]
-        y_train, y_test = y_fat[train_idx], y_fat[test_idx]
-        
-        # Train model for this fold
-        fold_classifier = FatigueClassifier(model_type=model_type)
-        fold_classifier.fit(X_train, y_train)
-        
-        # Predict
-        y_pred = fold_classifier.predict(X_test)
-        
-        # Collect predictions
-        all_y_fat_true.extend(y_test)
-        all_y_fat_pred.extend(y_pred)
-        
-        fold_acc = accuracy_score(y_test, y_pred)
-        fat_fold_accuracies.append(fold_acc)
-        print(f"  Fold {fold+1}: Accuracy = {fold_acc:.4f}")
-    
-    # Train final model on all data
-    fat_classifier = FatigueClassifier(model_type=model_type)
-    fat_classifier.fit(X_fat, y_fat)
-    
-    # Compute overall metrics from cross-validation
-    all_y_fat_true = np.array(all_y_fat_true)
-    all_y_fat_pred = np.array(all_y_fat_pred)
-    
-    fat_accuracy = accuracy_score(all_y_fat_true, all_y_fat_pred)
-    print(f"\nFatigue Classifier CV Accuracy: {fat_accuracy:.4f} (+/- {np.std(fat_fold_accuracies):.4f})")
-    print("\nClassification Report (aggregated from all folds):")
-    print_classification_report(
-        all_y_fat_true, all_y_fat_pred,
-        labels=fat_classifier.get_classes(),
-        target_names=fat_classifier.get_classes()
-    )
-    
-    # Plot confusion matrix with aggregated predictions from all folds
-    plot_confusion_matrix(
-        all_y_fat_true, all_y_fat_pred,
-        labels=fat_classifier.get_classes(),
-        title=f'Fatigue Classification Confusion Matrix ({n_folds}-Fold CV)',
-        save_path='fatigue_confusion_matrix.png'
-    )
-    
-    return amp_classifier, fat_classifier
+# ==================== 分类器评估 ====================
 
+def evaluate_classifiers(X_raw, X_feat, y, task_name, target_len):
+    """评估多种分类器"""
+    print(f"\n{'='*60}")
+    print(f"任务: {task_name}")
+    print(f"{'='*60}")
+    
+    le = LabelEncoder()
+    y_enc = le.fit_transform(y)
+    
+    # 准备数据
+    X_raw_resized = np.array([resize_signal(normalize_signal(s), target_len) for s in X_raw])
+    
+    X_raw_train, X_raw_test, y_train, y_test = train_test_split(
+        X_raw_resized, y_enc, test_size=0.2, random_state=RANDOM_SEED, stratify=y_enc
+    )
+    
+    # 使用相同的随机种子划分特征数据，确保一致性
+    X_feat_train, X_feat_test, _, _ = train_test_split(
+        X_feat, y_enc, test_size=0.2, random_state=RANDOM_SEED, stratify=y_enc
+    )
+    
+    scaler = StandardScaler()
+    X_feat_train_s = scaler.fit_transform(X_feat_train)
+    X_feat_test_s = scaler.transform(X_feat_test)
+    
+    results = {}
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    num_classes = len(le.classes_)
+    
+    # ML模型
+    print("\n--- 机器学习模型 ---")
+    ml_models = {
+        'RandomForest': RandomForestClassifier(n_estimators=100, max_depth=15, random_state=RANDOM_SEED),
+        'XGBoost': XGBClassifier(n_estimators=100, max_depth=6, random_state=RANDOM_SEED, verbosity=0),
+        'SVM': SVC(kernel='rbf', random_state=RANDOM_SEED),
+        'KNN': KNeighborsClassifier(n_neighbors=5),
+        'GradientBoosting': GradientBoostingClassifier(n_estimators=100, random_state=RANDOM_SEED)
+    }
+    
+    for name, model in ml_models.items():
+        model.fit(X_feat_train_s, y_train)
+        pred = model.predict(X_feat_test_s)
+        acc = accuracy_score(y_test, pred)
+        f1 = f1_score(y_test, pred, average='weighted')
+        results[name] = {'acc': acc, 'f1': f1, 'pred': pred, 'model': model, 'type': 'ml'}
+        print(f"  {name}: Acc={acc:.4f}, F1={f1:.4f}")
+    
+    # DL模型
+    print("\n--- 深度学习模型 ---")
+    X_train_dl, X_val_dl, y_train_dl, y_val_dl = train_test_split(
+        X_raw_train, y_train, test_size=0.2, random_state=42, stratify=y_train
+    )
+    
+    dl_models = {
+        'CNN': CNNClassifier(num_classes),
+        'CNN+Transformer': CNNTransformer(num_classes)
+    }
+    
+    for name, model in dl_models.items():
+        trained, val_acc = train_model(model, X_train_dl, y_train_dl, X_val_dl, y_val_dl, epochs=50, device=device)
+        trained.eval()
+        with torch.no_grad():
+            x_test = torch.tensor(X_raw_test, dtype=torch.float32).to(device)
+            _, pred = torch.max(trained(x_test), 1)
+            pred = pred.cpu().numpy()
+        acc = accuracy_score(y_test, pred)
+        f1 = f1_score(y_test, pred, average='weighted')
+        results[name] = {'acc': acc, 'f1': f1, 'pred': pred, 'model': trained, 'type': 'dl'}
+        print(f"  {name}: Acc={acc:.4f}, F1={f1:.4f}")
+    
+    best = max(results, key=lambda k: results[k]['f1'])
+    print(f"\n最佳: {best} (F1={results[best]['f1']:.4f})")
+    
+    return {'best': best, 'results': results, 'y_test': y_test, 'le': le, 'scaler': scaler}
+
+
+# ==================== 可视化 ====================
+
+def plot_confusion_matrix(y_true, y_pred, classes, title, save_path):
+    """混淆矩阵"""
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=classes, yticklabels=classes)
+    plt.title(title)
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"保存: {save_path}")
+
+
+def plot_segments(segments, labels, save_path, n_per_class=3):
+    """绘制segment示例"""
+    unique = sorted(set(labels))
+    fig, axes = plt.subplots(len(unique), n_per_class, figsize=(15, 3*len(unique)))
+    if len(unique) == 1:
+        axes = axes.reshape(1, -1)
+    
+    for i, label in enumerate(unique):
+        idxs = [j for j, l in enumerate(labels) if l == label][:n_per_class]
+        for j, idx in enumerate(idxs):
+            ax = axes[i, j]
+            t = np.arange(len(segments[idx])) / 2000
+            ax.plot(t, segments[idx], lw=0.5)
+            ax.set_title(f'{label} #{j+1}')
+            ax.set_xlabel('Time (s)')
+            ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"保存: {save_path}")
+
+
+def plot_model_comparison(results, title, save_path):
+    """模型对比"""
+    names = list(results.keys())
+    accs = [results[n]['acc'] for n in names]
+    f1s = [results[n]['f1'] for n in names]
+    
+    x = np.arange(len(names))
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.bar(x - 0.2, accs, 0.4, label='Accuracy', color='steelblue')
+    ax.bar(x + 0.2, f1s, 0.4, label='F1', color='coral')
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=45, ha='right')
+    ax.set_ylim(0, 1.1)
+    ax.legend()
+    ax.set_title(title)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"保存: {save_path}")
+
+
+def plot_segmentation(signal, segments, amp_preds, fat_preds, amp_le, fat_le, save_path, title):
+    """绘制分割结果"""
+    fig, axes = plt.subplots(2, 1, figsize=(15, 8), sharex=True)
+    t = np.arange(len(signal)) / 2000
+    
+    # 信号 + 分割区域
+    ax1 = axes[0]
+    ax1.plot(t, signal, 'b-', lw=0.5, alpha=0.7)
+    colors = {'full': 'green', 'half': 'orange', 'invalid': 'red'}
+    
+    for i, (start, end) in enumerate(segments):
+        amp = amp_le.inverse_transform([amp_preds[i]])[0] if i < len(amp_preds) else 'unknown'
+        ax1.axvspan(start/2000, end/2000, alpha=0.3, color=colors.get(amp, 'gray'))
+        ax1.axvline(start/2000, color='r', ls='--', lw=0.5)
+        ax1.axvline(end/2000, color='r', ls='--', lw=0.5)
+    
+    ax1.set_ylabel('Amplitude')
+    ax1.set_title(f'{title} - Detected Actions')
+    ax1.grid(True, alpha=0.3)
+    
+    # 分类结果时间线
+    ax2 = axes[1]
+    fat_colors = {'free': 'lightgreen', 'light': 'yellow', 'medium': 'orange', 'heavy': 'red'}
+    
+    for i, (start, end) in enumerate(segments):
+        amp = amp_le.inverse_transform([amp_preds[i]])[0] if i < len(amp_preds) else '?'
+        fat = fat_le.inverse_transform([fat_preds[i]])[0] if i < len(fat_preds) else '?'
+        
+        ax2.barh(1, (end-start)/2000, left=start/2000, height=0.3, color=colors.get(amp, 'gray'), alpha=0.7)
+        ax2.text((start+end)/2/2000, 1, amp, ha='center', va='center', fontsize=8)
+        
+        ax2.barh(0, (end-start)/2000, left=start/2000, height=0.3, color=fat_colors.get(fat, 'gray'), alpha=0.7)
+        ax2.text((start+end)/2/2000, 0, fat, ha='center', va='center', fontsize=8)
+    
+    ax2.set_ylim(-0.5, 1.5)
+    ax2.set_yticks([0, 1])
+    ax2.set_yticklabels(['Fatigue', 'Amplitude'])
+    ax2.set_xlabel('Time (s)')
+    ax2.set_title('Classification Results')
+    ax2.grid(True, alpha=0.3, axis='x')
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"保存: {save_path}")
+
+
+# ==================== 主函数 ====================
 
 def main():
-    """Main pipeline execution."""
-    print("=" * 60)
-    print("EMG Signal Analysis Pipeline")
-    print("=" * 60)
+    print("="*60)
+    print("EMG 动作模式学习与分割系统")
+    print("="*60)
     
-    # Configuration
     TRAIN_DIR = 'train'
-    WINDOW_SIZE = 200  # 0.1 seconds at 2000 Hz
-    STEP_SIZE = 100    # 0.05 seconds at 2000 Hz (50% overlap)
-    MODEL_TYPE = 'random_forest'  # or 'xgboost'
-    N_FOLDS = 5  # Number of folds for cross-validation
-    
-    # Filtering options for better accuracy
-    # Amplitude classification only applies to 'free' fatigue state
-    FILTER_AMPLITUDE_BY_FATIGUE = True   # Use only 'free' fatigue for amplitude classification
-    # Fatigue classification only applies to 'full' amplitude
-    FILTER_FATIGUE_BY_AMPLITUDE = True   # Use only 'full' amplitude for fatigue classification
-    
-    # Check if train directory exists
-    if not os.path.exists(TRAIN_DIR):
-        print(f"Error: Training directory '{TRAIN_DIR}' not found!")
-        return
     
     os.makedirs('models', exist_ok=True)
+    os.makedirs('results', exist_ok=True)
     
-    # Step 1a: Train Activity Detector (sliding window classifier)
-    print("\nStep 1a: Training Activity Detector...")
-    activity_detector = train_activity_detector(
-        TRAIN_DIR,
-        window_size=WINDOW_SIZE,
-        step_size=STEP_SIZE,
-        model_type=MODEL_TYPE
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Device: {device}")
+    
+    # ========== 阶段1: 学习动作模式 ==========
+    print("\n" + "="*60)
+    print("阶段1: 学习 segment 动作模式")
+    print("="*60)
+    
+    segments, labels_amp, labels_fat, subjects = load_all_segments(TRAIN_DIR)
+    segments_filtered = [bandpass_filter(s) for s in segments]
+    features = extract_all_features(segments_filtered)
+    
+    # 可视化segments
+    plot_segments(segments_filtered, labels_amp, 'results/amplitude_segments.png')
+    plot_segments(segments_filtered, labels_fat, 'results/fatigue_segments.png')
+    
+    # 训练动作模式检测器
+    print("\n[训练动作模式检测器...]")
+    detector = ActionPatternDetector(num_amp_classes=len(set(labels_amp)))
+    detector, amp_le, target_len = train_pattern_detector(detector, segments_filtered, labels_amp, epochs=50, device=device)
+    
+    # 评估Amplitude分类
+    print("\n[评估Amplitude分类器...]")
+    amp_eval = evaluate_classifiers(segments_filtered, features, labels_amp, "Amplitude", TARGET_LENGTH)
+    plot_confusion_matrix(
+        amp_eval['y_test'], amp_eval['results'][amp_eval['best']]['pred'],
+        amp_eval['le'].classes_, f"Amplitude ({amp_eval['best']})", 'results/amplitude_confusion_matrix.png'
     )
-    activity_detector.save('models/activity_detector.pkl')
+    plot_model_comparison(amp_eval['results'], "Amplitude Models", 'results/amplitude_model_comparison.png')
     
-    # Step 1b: Train CRNN activity segmenter
-    print("\nStep 1b: Training CRNN Activity Segmenter...")
-    crnn_segmenter = train_crnn_activity_segmenter(
-        TRAIN_DIR,
-        sequence_length=400,
-        step_size=200,
-        epochs=3
+    # 评估Fatigue分类
+    print("\n[评估Fatigue分类器...]")
+    full_idx = [i for i, a in enumerate(labels_amp) if a == 'full']
+    segs_full = [segments_filtered[i] for i in full_idx]
+    feats_full = features[full_idx]
+    labels_fat_full = [labels_fat[i] for i in full_idx]
+    
+    fat_eval = evaluate_classifiers(segs_full, feats_full, labels_fat_full, "Fatigue", TARGET_LENGTH)
+    plot_confusion_matrix(
+        fat_eval['y_test'], fat_eval['results'][fat_eval['best']]['pred'],
+        fat_eval['le'].classes_, f"Fatigue ({fat_eval['best']})", 'results/fatigue_confusion_matrix.png'
     )
-    crnn_segmenter.save('models/crnn_activity_segmenter.pt')
+    plot_model_comparison(fat_eval['results'], "Fatigue Models", 'results/fatigue_model_comparison.png')
     
-    # Step 2: Train amplitude and fatigue classifiers with k-fold cross-validation
-    print("\nStep 2: Training Amplitude and Fatigue Classifiers with K-Fold CV...")
-    amp_classifier, fat_classifier = train_classifiers(
-        TRAIN_DIR,
-        model_type=MODEL_TYPE,
-        filter_amplitude_by_fatigue=FILTER_AMPLITUDE_BY_FATIGUE,
-        filter_fatigue_by_amplitude=FILTER_FATIGUE_BY_AMPLITUDE,
-        n_folds=N_FOLDS
-    )
+    # ========== 阶段2: 分割原始信号 ==========
+    print("\n" + "="*60)
+    print("阶段2: 使用动作模式分割原始信号")
+    print("="*60)
     
-    # Save classifiers
-    amp_classifier.save('models/amplitude_classifier.pkl')
-    fat_classifier.save('models/fatigue_classifier.pkl')
+    raw_files = get_raw_files(TRAIN_DIR)
+    print(f"找到 {len(raw_files)} 个原始信号")
     
-    print("\n" + "=" * 60)
-    print("Pipeline completed successfully!")
-    print("=" * 60)
-    print("\nModels saved to 'models/' directory:")
-    print("  - activity_detector.pkl")
-    print("  - crnn_activity_segmenter.pt")
-    print("  - amplitude_classifier.pkl")
-    print("  - fatigue_classifier.pkl")
-    print("\nConfusion matrices saved:")
-    print("  - amplitude_confusion_matrix.png")
-    print("  - fatigue_confusion_matrix.png")
+    # 获取分类器
+    amp_model = amp_eval['results'][amp_eval['best']]['model']
+    amp_scaler = amp_eval['scaler']
+    amp_le = amp_eval['le']
+    amp_type = amp_eval['results'][amp_eval['best']]['type']
+    
+    fat_model = fat_eval['results'][fat_eval['best']]['model']
+    fat_scaler = fat_eval['scaler']
+    fat_le = fat_eval['le']
+    fat_type = fat_eval['results'][fat_eval['best']]['type']
+    
+    for i, raw_file in enumerate(raw_files[:MAX_RAW_FILES]):
+        print(f"\n处理: {os.path.basename(raw_file)}")
+        signal = load_signal(raw_file)
+        signal_filtered = bandpass_filter(signal)
+        
+        # 用动作模式检测分割
+        segments_detected = detect_actions_with_pattern(
+            detector, signal_filtered, target_len, device=device
+        )
+        
+        print(f"  检测到 {len(segments_detected)} 个动作")
+        
+        # 对每个检测到的动作预测 amplitude 和 fatigue
+        amp_preds = []
+        fat_preds = []
+        
+        for start, end in segments_detected:
+            seg = signal_filtered[start:end]
+            feat = extract_features(seg).reshape(1, -1)
+            
+            # 预测 amplitude
+            if amp_type == 'ml':
+                feat_s = amp_scaler.transform(feat)
+                amp_pred = amp_model.predict(feat_s)[0]
+            else:
+                seg_resized = resize_signal(normalize_signal(seg), TARGET_LENGTH)
+                x = torch.tensor(seg_resized, dtype=torch.float32).unsqueeze(0).to(device)
+                amp_model.eval()
+                with torch.no_grad():
+                    _, pred = torch.max(amp_model(x), 1)
+                    amp_pred = pred.cpu().numpy()[0]
+            amp_preds.append(amp_pred)
+            
+            # 预测 fatigue
+            if fat_type == 'ml':
+                feat_s = fat_scaler.transform(feat)
+                fat_pred = fat_model.predict(feat_s)[0]
+            else:
+                seg_resized = resize_signal(normalize_signal(seg), TARGET_LENGTH)
+                x = torch.tensor(seg_resized, dtype=torch.float32).unsqueeze(0).to(device)
+                fat_model.eval()
+                with torch.no_grad():
+                    _, pred = torch.max(fat_model(x), 1)
+                    fat_pred = pred.cpu().numpy()[0]
+            fat_preds.append(fat_pred)
+        
+        for j, (start, end) in enumerate(segments_detected):
+            amp = amp_le.inverse_transform([amp_preds[j]])[0]
+            fat = fat_le.inverse_transform([fat_preds[j]])[0]
+            print(f"    [{start/2000:.2f}s - {end/2000:.2f}s] Amp={amp}, Fat={fat}")
+        
+        # 绘制分割结果
+        save_path = f'results/segmentation_{os.path.basename(raw_file).replace(".csv", ".png")}'
+        plot_segmentation(signal_filtered, segments_detected, amp_preds, fat_preds, 
+                         amp_le, fat_le, save_path, os.path.basename(raw_file))
+    
+    # ========== 总结 ==========
+    print("\n" + "="*60)
+    print("完成!")
+    print("="*60)
+    print(f"\nAmplitude最佳: {amp_eval['best']} (F1={amp_eval['results'][amp_eval['best']]['f1']:.4f})")
+    print(f"Fatigue最佳: {fat_eval['best']} (F1={fat_eval['results'][fat_eval['best']]['f1']:.4f})")
+    print("\n输出文件:")
+    print("  results/amplitude_confusion_matrix.png")
+    print("  results/fatigue_confusion_matrix.png")
+    print("  results/amplitude_segments.png")
+    print("  results/fatigue_segments.png")
+    print("  results/amplitude_model_comparison.png")
+    print("  results/fatigue_model_comparison.png")
+    print("  results/segmentation_*.png")
 
 
 if __name__ == '__main__':

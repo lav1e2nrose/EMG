@@ -5,10 +5,16 @@ Includes filtering, segmentation, and sliding window operations.
 import numpy as np
 import pandas as pd
 from scipy import signal
-from scipy.signal import butter, filtfilt, iirnotch
+from scipy.signal import butter, filtfilt, iirnotch, hilbert
 
 THREE_STATE_RATIO_MIN = 0.1
 THREE_STATE_RATIO_MAX = 0.9
+
+# Improved segmentation parameters
+DEFAULT_RMS_WINDOW_MS = 50      # Window size for RMS envelope calculation (ms)
+DEFAULT_MIN_SEGMENT_MS = 500    # Minimum segment duration (ms) 
+DEFAULT_MERGE_GAP_MS = 300      # Merge segments closer than this (ms)
+DEFAULT_SAMPLING_RATE = 2000    # Default sampling rate (Hz)
 
 
 def load_emg_data(filepath):
@@ -151,6 +157,302 @@ def compute_rms(window):
         float: RMS value
     """
     return np.sqrt(np.mean(window ** 2))
+
+
+def compute_rms_envelope(signal, window_size, fs=2000):
+    """
+    Compute RMS envelope of the signal using a sliding window.
+    
+    Args:
+        signal: array-like, EMG signal
+        window_size: int, window size in samples
+        fs: int, sampling rate in Hz
+    
+    Returns:
+        np.array: RMS envelope
+    """
+    if window_size <= 0:
+        window_size = int(DEFAULT_RMS_WINDOW_MS * fs / 1000)
+    
+    # Use convolution for efficient RMS computation
+    squared = signal ** 2
+    kernel = np.ones(window_size) / window_size
+    mean_squared = np.convolve(squared, kernel, mode='same')
+    rms_envelope = np.sqrt(mean_squared)
+    
+    return rms_envelope
+
+
+def compute_mav_envelope(signal, window_size):
+    """
+    Compute Mean Absolute Value (MAV) envelope of the signal.
+    
+    Args:
+        signal: array-like, EMG signal
+        window_size: int, window size in samples
+    
+    Returns:
+        np.array: MAV envelope
+    """
+    kernel = np.ones(window_size) / window_size
+    mav_envelope = np.convolve(np.abs(signal), kernel, mode='same')
+    return mav_envelope
+
+
+def compute_adaptive_threshold(envelope, method='otsu', percentile=75):
+    """
+    Compute adaptive threshold for activity detection.
+    
+    Args:
+        envelope: array-like, signal envelope (RMS or MAV)
+        method: str, thresholding method ('otsu', 'percentile', 'mean_std')
+        percentile: int, percentile value for 'percentile' method
+    
+    Returns:
+        float: threshold value
+    """
+    if method == 'otsu':
+        # Otsu's method for automatic thresholding
+        hist, bin_edges = np.histogram(envelope, bins=256)
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+        
+        # Compute cumulative sums and means
+        weight1 = np.cumsum(hist)
+        weight2 = np.cumsum(hist[::-1])[::-1]
+        
+        mean1 = np.cumsum(hist * bin_centers) / (weight1 + 1e-10)
+        mean2 = (np.cumsum((hist * bin_centers)[::-1])[::-1]) / (weight2 + 1e-10)
+        
+        # Compute between-class variance
+        variance = weight1[:-1] * weight2[1:] * (mean1[:-1] - mean2[1:]) ** 2
+        
+        # Find optimal threshold
+        idx = np.argmax(variance)
+        threshold = bin_centers[idx]
+        
+    elif method == 'percentile':
+        threshold = np.percentile(envelope, percentile)
+        
+    elif method == 'mean_std':
+        # Mean + standard deviation based threshold
+        mean_val = np.mean(envelope)
+        std_val = np.std(envelope)
+        threshold = mean_val + 0.5 * std_val
+        
+    else:
+        # Default: use median
+        threshold = np.median(envelope)
+    
+    return threshold
+
+
+def detect_activity_regions(signal, fs=2000, rms_window_ms=None, 
+                            min_segment_ms=None, merge_gap_ms=None,
+                            threshold_method='otsu', threshold_multiplier=1.0):
+    """
+    Detect activity regions in EMG signal using RMS envelope and adaptive thresholding.
+    This is the improved segmentation algorithm that uses:
+    1. RMS envelope for smooth activity detection
+    2. Adaptive thresholding (Otsu's method by default)
+    3. Minimum segment length filtering
+    4. Segment merging for close segments
+    
+    Args:
+        signal: array-like, preprocessed EMG signal
+        fs: int, sampling rate in Hz
+        rms_window_ms: int, RMS window size in ms (default: 50)
+        min_segment_ms: int, minimum segment duration in ms (default: 500)
+        merge_gap_ms: int, merge segments closer than this in ms (default: 300)
+        threshold_method: str, method for threshold computation ('otsu', 'percentile', 'mean_std')
+        threshold_multiplier: float, multiplier for threshold adjustment
+    
+    Returns:
+        list: list of tuples (start, end) for each detected segment
+    """
+    # Use default values if not provided
+    if rms_window_ms is None:
+        rms_window_ms = DEFAULT_RMS_WINDOW_MS
+    if min_segment_ms is None:
+        min_segment_ms = DEFAULT_MIN_SEGMENT_MS
+    if merge_gap_ms is None:
+        merge_gap_ms = DEFAULT_MERGE_GAP_MS
+    
+    # Convert ms to samples
+    rms_window = int(rms_window_ms * fs / 1000)
+    min_segment_samples = int(min_segment_ms * fs / 1000)
+    merge_gap_samples = int(merge_gap_ms * fs / 1000)
+    
+    # Compute RMS envelope
+    rms_env = compute_rms_envelope(signal, rms_window, fs)
+    
+    # Compute adaptive threshold
+    threshold = compute_adaptive_threshold(rms_env, method=threshold_method)
+    threshold *= threshold_multiplier
+    
+    # Find regions above threshold
+    above_threshold = rms_env > threshold
+    
+    # Find segment boundaries
+    segments = []
+    in_segment = False
+    segment_start = 0
+    
+    for i, is_active in enumerate(above_threshold):
+        if is_active and not in_segment:
+            in_segment = True
+            segment_start = i
+        elif not is_active and in_segment:
+            in_segment = False
+            segment_end = i
+            segments.append((segment_start, segment_end))
+    
+    # Handle case where signal ends while in segment
+    if in_segment:
+        segments.append((segment_start, len(signal)))
+    
+    # Filter by minimum length
+    filtered_segments = []
+    for start, end in segments:
+        if end - start >= min_segment_samples:
+            filtered_segments.append((start, end))
+    segments = filtered_segments
+    
+    # Merge close segments
+    if len(segments) > 1:
+        merged = [segments[0]]
+        for cur_start, cur_end in segments[1:]:
+            prev_start, prev_end = merged[-1]
+            if cur_start - prev_end <= merge_gap_samples:
+                # Merge with previous
+                merged[-1] = (prev_start, cur_end)
+            else:
+                merged.append((cur_start, cur_end))
+        segments = merged
+    
+    return segments
+
+
+def segment_signal_improved(signal, fs=2000, rms_window_ms=50, 
+                           min_segment_ms=500, merge_gap_ms=300,
+                           use_dual_threshold=True):
+    """
+    Improved signal segmentation using multi-feature approach.
+    
+    This function combines:
+    1. RMS envelope for amplitude detection
+    2. MAV envelope for activity confirmation
+    3. Dual-threshold hysteresis for stable boundaries
+    4. Post-processing for segment refinement
+    
+    Args:
+        signal: array-like, preprocessed EMG signal
+        fs: int, sampling rate in Hz
+        rms_window_ms: int, RMS window size in ms
+        min_segment_ms: int, minimum segment duration in ms
+        merge_gap_ms: int, merge segments closer than this in ms
+        use_dual_threshold: bool, use hysteresis thresholding
+    
+    Returns:
+        list: list of tuples (start, end) for each detected segment
+    """
+    # Convert ms to samples
+    rms_window = max(1, int(rms_window_ms * fs / 1000))
+    min_segment_samples = int(min_segment_ms * fs / 1000)
+    merge_gap_samples = int(merge_gap_ms * fs / 1000)
+    
+    # Compute RMS envelope
+    rms_env = compute_rms_envelope(signal, rms_window, fs)
+    
+    # Compute MAV envelope for confirmation
+    mav_env = compute_mav_envelope(signal, rms_window)
+    
+    # Normalize envelopes
+    rms_norm = rms_env / (np.max(rms_env) + 1e-10)
+    mav_norm = mav_env / (np.max(mav_env) + 1e-10)
+    
+    # Combined envelope (weighted average)
+    combined_env = 0.7 * rms_norm + 0.3 * mav_norm
+    
+    if use_dual_threshold:
+        # Dual threshold (hysteresis) for stable boundaries
+        # High threshold for segment start, low threshold for segment end
+        high_thresh = compute_adaptive_threshold(combined_env, method='otsu')
+        low_thresh = high_thresh * 0.6  # 60% of high threshold
+        
+        # Apply hysteresis thresholding
+        segments = []
+        in_segment = False
+        segment_start = 0
+        
+        for i, val in enumerate(combined_env):
+            if not in_segment and val > high_thresh:
+                in_segment = True
+                segment_start = i
+            elif in_segment and val < low_thresh:
+                in_segment = False
+                segments.append((segment_start, i))
+        
+        if in_segment:
+            segments.append((segment_start, len(signal)))
+    else:
+        # Simple thresholding
+        threshold = compute_adaptive_threshold(combined_env, method='otsu')
+        above_threshold = combined_env > threshold
+        
+        segments = []
+        in_segment = False
+        segment_start = 0
+        
+        for i, is_active in enumerate(above_threshold):
+            if is_active and not in_segment:
+                in_segment = True
+                segment_start = i
+            elif not is_active and in_segment:
+                in_segment = False
+                segments.append((segment_start, i))
+        
+        if in_segment:
+            segments.append((segment_start, len(signal)))
+    
+    # Filter by minimum length
+    filtered_segments = []
+    for start, end in segments:
+        if end - start >= min_segment_samples:
+            filtered_segments.append((start, end))
+    segments = filtered_segments
+    
+    # Merge close segments
+    if len(segments) > 1:
+        merged = [segments[0]]
+        for cur_start, cur_end in segments[1:]:
+            prev_start, prev_end = merged[-1]
+            if cur_start - prev_end <= merge_gap_samples:
+                merged[-1] = (prev_start, cur_end)
+            else:
+                merged.append((cur_start, cur_end))
+        segments = merged
+    
+    # Refine segment boundaries by extending to local minima
+    refined_segments = []
+    for start, end in segments:
+        # Extend start backward to local minimum (within limit)
+        search_start = max(0, start - min_segment_samples // 4)
+        if search_start < start:
+            local_min_start = search_start + np.argmin(combined_env[search_start:start])
+            # Only extend if it's actually a minimum
+            if combined_env[local_min_start] < combined_env[start] * 0.8:
+                start = local_min_start
+        
+        # Extend end forward to local minimum (within limit)
+        search_end = min(len(signal), end + min_segment_samples // 4)
+        if end < search_end:
+            local_min_end = end + np.argmin(combined_env[end:search_end])
+            if combined_env[local_min_end] < combined_env[end-1] * 0.8:
+                end = local_min_end
+        
+        refined_segments.append((start, end))
+    
+    return refined_segments
 
 
 def label_windows_from_segments(signal_length, segment_ranges, window_size, step_size,

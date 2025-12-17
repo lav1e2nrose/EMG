@@ -6,7 +6,7 @@ import os
 import sys
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
 # Add src to path
@@ -16,7 +16,8 @@ from preprocessing import (
     load_emg_data, preprocess_signal, create_sliding_windows,
     label_windows_from_segments, improved_get_segment_ranges,
     detect_activity_segments, label_signal_three_state,
-    create_sequence_windows_for_segmentation, decode_three_state_predictions
+    create_sequence_windows_for_segmentation, decode_three_state_predictions,
+    segment_signal_improved, detect_activity_regions
 )
 from features import extract_features_from_windows, extract_segment_features
 from models import ActivityDetector, AmplitudeClassifier, FatigueClassifier, CRNNActivitySegmenter
@@ -214,21 +215,59 @@ def segment_signal_with_detector(signal, detector, window_size=200, step_size=10
     return segments
 
 
-def train_classifiers(train_dir, model_type='random_forest', 
-                     filter_amplitude_by_fatigue=False, filter_fatigue_by_amplitude=False):
+def segment_signal_rms_based(signal, fs=2000, rms_window_ms=50, 
+                             min_segment_ms=500, merge_gap_ms=300,
+                             use_dual_threshold=True):
     """
-    Train amplitude and fatigue classifiers using segmented data.
+    Segment a signal using improved RMS-based detection.
+    This is the recommended method for better segmentation quality.
+    
+    Uses:
+    1. RMS envelope for amplitude detection
+    2. Adaptive (Otsu) thresholding
+    3. Dual-threshold hysteresis for stable boundaries
+    4. Minimum segment length filtering
+    5. Close segment merging
+    
+    Args:
+        signal: array-like, preprocessed signal
+        fs: int, sampling rate in Hz
+        rms_window_ms: int, RMS window size in ms
+        min_segment_ms: int, minimum segment duration in ms
+        merge_gap_ms: int, merge segments closer than this in ms
+        use_dual_threshold: bool, use hysteresis thresholding
+    
+    Returns:
+        list: list of tuples (start, end) for detected segments
+    """
+    return segment_signal_improved(
+        signal, fs=fs, 
+        rms_window_ms=rms_window_ms,
+        min_segment_ms=min_segment_ms,
+        merge_gap_ms=merge_gap_ms,
+        use_dual_threshold=use_dual_threshold
+    )
+
+
+def train_classifiers(train_dir, model_type='random_forest', 
+                     filter_amplitude_by_fatigue=True, filter_fatigue_by_amplitude=True,
+                     n_folds=5):
+    """
+    Train amplitude and fatigue classifiers using segmented data with k-fold cross-validation.
     
     Args:
         train_dir: str, path to training directory
         model_type: str, 'random_forest' or 'xgboost'
         filter_amplitude_by_fatigue: bool, if True, use only 'free' fatigue for amplitude training
+                                     (Default: True - amplitude classes only apply to 'free' state)
         filter_fatigue_by_amplitude: bool, if True, use only 'full' amplitude for fatigue training
+                                     (Default: True - fatigue only applies to 'full' amplitude)
+        n_folds: int, number of folds for cross-validation (default: 5)
     
     Returns:
         tuple: (AmplitudeClassifier, FatigueClassifier)
     """
-    print("\n=== Training Classifiers ===")
+    print("\n=== Training Classifiers with K-Fold Cross-Validation ===")
     
     # Collect all segment data
     segments_data = []
@@ -286,13 +325,14 @@ def train_classifiers(train_dir, model_type='random_forest',
         print(f"  Subject {subj}: {subject_counts[subj]} samples")
     
     # Prepare data for amplitude classification
+    # IMPORTANT: Amplitude classification (full/half/invalid) only applies to 'free' fatigue state
     X_amp = []
     y_amp = []
     subj_amp = []
     
     for seg in segments_data:
         if seg['features'] is not None:
-            # Apply filtering if requested
+            # Apply filtering: amplitude classes only apply when fatigue is 'free'
             if filter_amplitude_by_fatigue and seg['fatigue'] != 'free':
                 continue
             
@@ -305,50 +345,77 @@ def train_classifiers(train_dir, model_type='random_forest',
     y_amp = np.array(y_amp)
     subj_amp = np.array(subj_amp)
     
-    # Train amplitude classifier
-    print("\n--- Training Amplitude Classifier ---")
+    # Train amplitude classifier with k-fold cross-validation
+    print("\n--- Training Amplitude Classifier with K-Fold CV ---")
     if filter_amplitude_by_fatigue:
-        print("Using filtered data: only 'free' fatigue samples")
+        print("Using filtered data: only 'free' fatigue samples (amplitude classification only applies to 'free' state)")
     print(f"Total samples: {len(y_amp)}")
     unique_classes, class_counts = np.unique(y_amp, return_counts=True)
     print(f"Samples per amplitude class:")
     for cls, count in zip(unique_classes, class_counts):
         print(f"  {cls}: {count} samples")
+    print(f"Using {n_folds}-fold cross-validation")
     
-    X_amp_train, X_amp_test, y_amp_train, y_amp_test = train_test_split(
-        X_amp, y_amp, test_size=0.2, random_state=42, stratify=y_amp
-    )
+    # K-fold cross-validation for amplitude classifier
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
     
+    all_y_amp_true = []
+    all_y_amp_pred = []
+    amp_fold_accuracies = []
+    
+    for fold, (train_idx, test_idx) in enumerate(skf.split(X_amp, y_amp)):
+        X_train, X_test = X_amp[train_idx], X_amp[test_idx]
+        y_train, y_test = y_amp[train_idx], y_amp[test_idx]
+        
+        # Train model for this fold
+        fold_classifier = AmplitudeClassifier(model_type=model_type)
+        fold_classifier.fit(X_train, y_train)
+        
+        # Predict
+        y_pred = fold_classifier.predict(X_test)
+        
+        # Collect predictions
+        all_y_amp_true.extend(y_test)
+        all_y_amp_pred.extend(y_pred)
+        
+        fold_acc = accuracy_score(y_test, y_pred)
+        amp_fold_accuracies.append(fold_acc)
+        print(f"  Fold {fold+1}: Accuracy = {fold_acc:.4f}")
+    
+    # Train final model on all data
     amp_classifier = AmplitudeClassifier(model_type=model_type)
-    amp_classifier.fit(X_amp_train, y_amp_train)
+    amp_classifier.fit(X_amp, y_amp)
     
-    y_amp_pred = amp_classifier.predict(X_amp_test)
-    amp_accuracy = accuracy_score(y_amp_test, y_amp_pred)
+    # Compute overall metrics from cross-validation
+    all_y_amp_true = np.array(all_y_amp_true)
+    all_y_amp_pred = np.array(all_y_amp_pred)
     
-    print(f"\nAmplitude Classifier Accuracy: {amp_accuracy:.4f}")
-    print("\nClassification Report:")
+    amp_accuracy = accuracy_score(all_y_amp_true, all_y_amp_pred)
+    print(f"\nAmplitude Classifier CV Accuracy: {amp_accuracy:.4f} (+/- {np.std(amp_fold_accuracies):.4f})")
+    print("\nClassification Report (aggregated from all folds):")
     print_classification_report(
-        y_amp_test, y_amp_pred,
+        all_y_amp_true, all_y_amp_pred,
         labels=amp_classifier.get_classes(),
         target_names=amp_classifier.get_classes()
     )
     
-    # Plot confusion matrix
+    # Plot confusion matrix with aggregated predictions from all folds
     plot_confusion_matrix(
-        y_amp_test, y_amp_pred,
+        all_y_amp_true, all_y_amp_pred,
         labels=amp_classifier.get_classes(),
-        title='Amplitude Classification Confusion Matrix',
+        title=f'Amplitude Classification Confusion Matrix ({n_folds}-Fold CV)',
         save_path='amplitude_confusion_matrix.png'
     )
     
     # Prepare data for fatigue classification (only 'full' amplitude)
+    # IMPORTANT: Fatigue classification only applies to 'full' amplitude samples
     X_fat = []
     y_fat = []
     subj_fat = []
     
     for seg in segments_data:
-        if seg['amplitude'] == 'full' and seg['features'] is not None:
-            # Apply filtering if requested (already filtered by amplitude='full')
+        if seg['features'] is not None:
+            # Fatigue classification only applies to 'full' amplitude
             if filter_fatigue_by_amplitude and seg['amplitude'] != 'full':
                 continue
             
@@ -361,38 +428,62 @@ def train_classifiers(train_dir, model_type='random_forest',
     y_fat = np.array(y_fat)
     subj_fat = np.array(subj_fat)
     
-    # Train fatigue classifier
-    print("\n--- Training Fatigue Classifier ---")
-    print("Using only 'full' amplitude samples (by constraint)")
+    # Train fatigue classifier with k-fold cross-validation
+    print("\n--- Training Fatigue Classifier with K-Fold CV ---")
+    print("Using only 'full' amplitude samples (fatigue classification only applies to 'full' amplitude)")
     print(f"Total samples: {len(y_fat)}")
     unique_classes, class_counts = np.unique(y_fat, return_counts=True)
     print(f"Samples per fatigue class:")
     for cls, count in zip(unique_classes, class_counts):
         print(f"  {cls}: {count} samples")
+    print(f"Using {n_folds}-fold cross-validation")
     
-    X_fat_train, X_fat_test, y_fat_train, y_fat_test = train_test_split(
-        X_fat, y_fat, test_size=0.2, random_state=42, stratify=y_fat
-    )
+    # K-fold cross-validation for fatigue classifier
+    all_y_fat_true = []
+    all_y_fat_pred = []
+    fat_fold_accuracies = []
     
+    for fold, (train_idx, test_idx) in enumerate(skf.split(X_fat, y_fat)):
+        X_train, X_test = X_fat[train_idx], X_fat[test_idx]
+        y_train, y_test = y_fat[train_idx], y_fat[test_idx]
+        
+        # Train model for this fold
+        fold_classifier = FatigueClassifier(model_type=model_type)
+        fold_classifier.fit(X_train, y_train)
+        
+        # Predict
+        y_pred = fold_classifier.predict(X_test)
+        
+        # Collect predictions
+        all_y_fat_true.extend(y_test)
+        all_y_fat_pred.extend(y_pred)
+        
+        fold_acc = accuracy_score(y_test, y_pred)
+        fat_fold_accuracies.append(fold_acc)
+        print(f"  Fold {fold+1}: Accuracy = {fold_acc:.4f}")
+    
+    # Train final model on all data
     fat_classifier = FatigueClassifier(model_type=model_type)
-    fat_classifier.fit(X_fat_train, y_fat_train)
+    fat_classifier.fit(X_fat, y_fat)
     
-    y_fat_pred = fat_classifier.predict(X_fat_test)
-    fat_accuracy = accuracy_score(y_fat_test, y_fat_pred)
+    # Compute overall metrics from cross-validation
+    all_y_fat_true = np.array(all_y_fat_true)
+    all_y_fat_pred = np.array(all_y_fat_pred)
     
-    print(f"\nFatigue Classifier Accuracy: {fat_accuracy:.4f}")
-    print("\nClassification Report:")
+    fat_accuracy = accuracy_score(all_y_fat_true, all_y_fat_pred)
+    print(f"\nFatigue Classifier CV Accuracy: {fat_accuracy:.4f} (+/- {np.std(fat_fold_accuracies):.4f})")
+    print("\nClassification Report (aggregated from all folds):")
     print_classification_report(
-        y_fat_test, y_fat_pred,
+        all_y_fat_true, all_y_fat_pred,
         labels=fat_classifier.get_classes(),
         target_names=fat_classifier.get_classes()
     )
     
-    # Plot confusion matrix
+    # Plot confusion matrix with aggregated predictions from all folds
     plot_confusion_matrix(
-        y_fat_test, y_fat_pred,
+        all_y_fat_true, all_y_fat_pred,
         labels=fat_classifier.get_classes(),
-        title='Fatigue Classification Confusion Matrix',
+        title=f'Fatigue Classification Confusion Matrix ({n_folds}-Fold CV)',
         save_path='fatigue_confusion_matrix.png'
     )
     
@@ -410,10 +501,13 @@ def main():
     WINDOW_SIZE = 200  # 0.1 seconds at 2000 Hz
     STEP_SIZE = 100    # 0.05 seconds at 2000 Hz (50% overlap)
     MODEL_TYPE = 'random_forest'  # or 'xgboost'
+    N_FOLDS = 5  # Number of folds for cross-validation
     
     # Filtering options for better accuracy
-    FILTER_AMPLITUDE_BY_FATIGUE = False  # Set to True to use only 'free' fatigue for amplitude
-    FILTER_FATIGUE_BY_AMPLITUDE = True   # Already enforced by using only 'full' amplitude
+    # Amplitude classification only applies to 'free' fatigue state
+    FILTER_AMPLITUDE_BY_FATIGUE = True   # Use only 'free' fatigue for amplitude classification
+    # Fatigue classification only applies to 'full' amplitude
+    FILTER_FATIGUE_BY_AMPLITUDE = True   # Use only 'full' amplitude for fatigue classification
     
     # Check if train directory exists
     if not os.path.exists(TRAIN_DIR):
@@ -442,13 +536,14 @@ def main():
     )
     crnn_segmenter.save('models/crnn_activity_segmenter.pt')
     
-    # Step 2: Train amplitude and fatigue classifiers
-    print("\nStep 2: Training Amplitude and Fatigue Classifiers...")
+    # Step 2: Train amplitude and fatigue classifiers with k-fold cross-validation
+    print("\nStep 2: Training Amplitude and Fatigue Classifiers with K-Fold CV...")
     amp_classifier, fat_classifier = train_classifiers(
         TRAIN_DIR,
         model_type=MODEL_TYPE,
         filter_amplitude_by_fatigue=FILTER_AMPLITUDE_BY_FATIGUE,
-        filter_fatigue_by_amplitude=FILTER_FATIGUE_BY_AMPLITUDE
+        filter_fatigue_by_amplitude=FILTER_FATIGUE_BY_AMPLITUDE,
+        n_folds=N_FOLDS
     )
     
     # Save classifiers

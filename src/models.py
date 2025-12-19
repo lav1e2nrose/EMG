@@ -430,3 +430,29 @@ class CNNTransformerClassifier:
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
         print(f"模型已从 {filepath} 加载")
+
+
+class CRNNActivitySegmenter:
+    """
+    Lightweight placeholder CRNN-style segmenter used solely for
+    backward-compatible testing. It exposes a minimal interface and
+    returns zero-valued predictions matching the input window shape.
+    """
+    def __init__(self, sequence_length=200, step_size=50, device="cpu"):
+        self.sequence_length = sequence_length
+        self.step_size = step_size
+        self.device = device
+    
+    def predict(self, windows):
+        """
+        Generate zero predictions with the same shape as the input.
+        
+        Args:
+            windows: np.array shaped (batch, sequence_length)
+        
+        Returns:
+            np.array: binary predictions with identical shape
+        """
+        import numpy as np
+        windows = np.asarray(windows)
+        return np.zeros_like(windows, dtype=int)

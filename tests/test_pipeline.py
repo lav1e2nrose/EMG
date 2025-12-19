@@ -17,7 +17,8 @@ from preprocessing import (
     create_sequence_windows_for_segmentation,
     compute_rms_envelope, compute_mav_envelope,
     compute_adaptive_threshold, detect_activity_regions,
-    segment_signal_improved, improved_get_segment_ranges
+    segment_signal_improved, improved_get_segment_ranges,
+    find_segment_in_raw_signal, learn_segment_basis_and_detect
 )
 from features import (
     compute_rms, compute_mav, compute_zc, compute_ssc, compute_wl,
@@ -220,6 +221,37 @@ class TestPreprocessing(unittest.TestCase):
         segments = segment_signal_improved(signal, fs=fs, min_segment_ms=100, merge_gap_ms=300)
         
         self.assertIsInstance(segments, list)
+
+    def test_find_segment_in_raw_signal_precise(self):
+        """Correlation-based overlay should return exact start."""
+        rng = np.random.default_rng(0)
+        raw = rng.standard_normal(3000) * 0.05
+        start_true = 750
+        burst = rng.standard_normal(200) * 2.0
+        raw[start_true:start_true + len(burst)] += burst
+        segment = raw[start_true:start_true + len(burst)]
+
+        start_idx = find_segment_in_raw_signal(raw, segment, min_correlation=0.5)
+        self.assertIsNotNone(start_idx)
+        self.assertAlmostEqual(start_idx, start_true, delta=2)
+
+    def test_learn_segment_basis_and_detect(self):
+        """ML-based basis should recover segments when overlay is unknown."""
+        fs = 2000
+        rng = np.random.default_rng(1)
+        raw = rng.standard_normal(5000) * 0.05
+        burst = np.sin(np.linspace(0, 2 * np.pi, 400)) * 2.0
+        raw[600:1000] += burst
+        raw[2600:3000] += burst
+
+        seg_signal = raw[600:1000]
+        segments = learn_segment_basis_and_detect(
+            raw, [seg_signal], fs=fs, window_ms=50, step_ms=25, min_length=80, prob_threshold=0.4
+        )
+
+        self.assertIsInstance(segments, list)
+        self.assertTrue(len(segments) > 0)
+        self.assertTrue(any(abs(s - 600) < 150 for s, _ in segments))
 
     def test_improved_get_segment_ranges_with_fallback(self):
         """Test that improved_get_segment_ranges falls back to automatic detection."""

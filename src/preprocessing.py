@@ -634,12 +634,13 @@ def get_segment_ranges_from_files(raw_filepath, segment_dir):
 def find_segment_in_raw_signal(raw_signal, segment_signal, search_window=10000,
                                min_correlation=0.7):
     """
-    Find where a segment appears in the raw signal using correlation.
+    Find where a segment appears in the raw signal using high-resolution
+    normalized cross-correlation (no coarse stepping).
     
     Args:
         raw_signal: array-like, full raw signal
         segment_signal: array-like, segment to find
-        search_window: int, maximum search window size
+        search_window: int, maximum search window size (unused placeholder)
         min_correlation: float, minimum correlation to accept a match
     
     Returns:
@@ -650,29 +651,22 @@ def find_segment_in_raw_signal(raw_signal, segment_signal, search_window=10000,
     if seg_len > len(raw_signal):
         return None
     
-    # Use correlation to find best match
-    best_correlation = -np.inf
-    best_start = 0
+    # Remove mean to avoid DC bias and compute sliding normalized correlation
+    seg = np.asarray(segment_signal, dtype=float) - np.mean(segment_signal)
+    raw = np.asarray(raw_signal, dtype=float) - np.mean(raw_signal)
     
-    # Normalize signals for correlation
-    seg_norm = (segment_signal - np.mean(segment_signal)) / (np.std(segment_signal) + 1e-10)
+    seg_energy = np.sqrt(np.sum(seg ** 2)) + 1e-10
+    if seg_energy < 1e-10:
+        return None
     
-    for start in range(0, len(raw_signal) - seg_len + 1, 100):  # Step by 100 for efficiency
-        window = raw_signal[start:start + seg_len]
-        window_norm = (window - np.mean(window)) / (np.std(window) + 1e-10)
-        
-        if np.std(window_norm) < 1e-10 or np.std(seg_norm) < 1e-10:
-            continue
-        
-        correlation = np.corrcoef(seg_norm, window_norm)[0, 1]
-        if np.isnan(correlation):
-            continue
-        
-        if correlation > best_correlation:
-            best_correlation = correlation
-            best_start = start
+    # Correlate with stride 1 for exact positioning
+    corr = signal.correlate(raw, seg, mode='valid')
+    raw_energy = np.sqrt(signal.convolve(raw ** 2, np.ones(seg_len), mode='valid')) + 1e-10
+    norm_corr = corr / (seg_energy * raw_energy)
     
-    # Return if correlation is high enough
+    best_start = int(np.argmax(norm_corr))
+    best_correlation = norm_corr[best_start]
+    
     if best_correlation >= min_correlation:
         return best_start
     
@@ -708,7 +702,7 @@ def improved_get_segment_ranges(raw_filepath, segment_dir):
         seg_data = load_emg_data(seg_path)
         total_segment_length += len(seg_data)
     
-    # Try correlation-based matching first
+    # Try correlation-based matching first (exact overlay)
     segment_ranges = []
     for seg_file in segment_files:
         seg_path = os.path.join(segment_dir, seg_file)
@@ -726,27 +720,113 @@ def improved_get_segment_ranges(raw_filepath, segment_dir):
     if len(segment_ranges) > 0:
         return segment_ranges
     
-    # Fallback: Use automatic RMS-based detection with multiple parameter attempts
-    # Try different parameter combinations to find segments
+    # Fallback 1: learn a segmentation basis from provided manual cuts
+    # and apply a lightweight ML classifier to raw for overlay recovery.
+    try:
+        ml_segments = learn_segment_basis_and_detect(
+            raw_filtered,
+            [load_emg_data(os.path.join(segment_dir, f)) for f in segment_files],
+            fs=DEFAULT_SAMPLING_RATE
+        )
+        if len(ml_segments) > 0:
+            return ml_segments
+    except Exception:
+        # If anything goes wrong, continue to heuristic fallback
+        pass
+    
+    # Fallback 2: Use automatic RMS-based detection with multiple parameter attempts
     if num_manual_segments > 0 and total_segment_length > 0:
-        # Try with different min_segment_ms and threshold combinations
-        # Start with more permissive parameters (smaller min_segment_ms)
         for min_seg_ms in FALLBACK_MIN_SEGMENT_MS_OPTIONS:
             for threshold_mult in FALLBACK_THRESHOLD_MULTIPLIERS:
                 auto_segments = detect_activity_regions(
                     raw_filtered, 
-                    fs=2000,
+                    fs=DEFAULT_SAMPLING_RATE,
                     min_segment_ms=min_seg_ms,
                     merge_gap_ms=200,  # Use smaller merge gap for better segment separation
                     threshold_multiplier=threshold_mult
                 )
                 
-                # If we found at least some segments, use them
                 if len(auto_segments) > 0:
                     return auto_segments
     
     # Last resort: return empty list (no segments found)
     return segment_ranges
+
+
+def _basic_window_features(window):
+    """
+    Lightweight feature vector for segmentation basis learning.
+    """
+    w = np.asarray(window, dtype=float)
+    return np.array([
+        np.mean(w),
+        np.std(w),
+        compute_rms(w),
+        np.mean(np.abs(w)),
+        np.max(w) - np.min(w)
+    ])
+
+
+def learn_segment_basis_and_detect(raw_signal, segment_signals, fs=DEFAULT_SAMPLING_RATE,
+                                   window_ms=200, step_ms=50, min_length=200, prob_threshold=0.5):
+    """
+    Learn a segmentation basis (machine learning) from manual segment signals
+    and apply it to the raw signal to recover overlay positions.
+    """
+    from sklearn.ensemble import RandomForestClassifier
+    
+    window_size = max(1, int(window_ms * fs / 1000))
+    step_size = max(1, int(step_ms * fs / 1000))
+    
+    # Build training data: positives from manual segments, negatives from raw
+    X = []
+    y = []
+    
+    pos_count = 0
+    for seg in segment_signals:
+        seg = np.asarray(seg, dtype=float)
+        for start in range(0, len(seg) - window_size + 1, step_size):
+            win = seg[start:start + window_size]
+            X.append(_basic_window_features(win))
+            y.append(1)
+            pos_count += 1
+    
+    # Negative samples from raw signal (random windows)
+    raw = np.asarray(raw_signal, dtype=float)
+    if len(raw) >= window_size:
+        for start in range(0, len(raw) - window_size + 1, step_size):
+            win = raw[start:start + window_size]
+            X.append(_basic_window_features(win))
+            y.append(0)
+    neg_count = len(X) - pos_count
+    
+    # Require at least a couple of positive/negative windows to train a classifier
+    if pos_count < 2 or neg_count < 2:
+        return []
+    
+    clf = RandomForestClassifier(n_estimators=50, random_state=42)
+    clf.fit(X, y)
+    
+    # Apply classifier across raw signal
+    predictions = []
+    start_indices = []
+    for start in range(0, len(raw) - window_size + 1, step_size):
+        win = raw[start:start + window_size]
+        feat = _basic_window_features(win).reshape(1, -1)
+        prob = clf.predict_proba(feat)[0, 1]
+        predictions.append(1 if prob >= prob_threshold else 0)
+        start_indices.append(start)
+    
+    if len(predictions) == 0:
+        return []
+    
+    segments = detect_activity_segments(
+        np.array(predictions),
+        np.array(start_indices),
+        min_length=max(min_length, window_size),
+        merge_gap=step_size
+    )
+    return segments
 
 
 def detect_activity_segments(predictions, start_indices, min_length=1000, merge_gap=500):

@@ -12,12 +12,15 @@ import sys
 from collections import defaultdict
 
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import numpy as np
 import seaborn as sns
+from sklearn.base import clone
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.metrics import accuracy_score, f1_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, cross_val_predict, train_test_split
 from sklearn.neighbors import KNeighborsClassifier
+from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.svm import SVC
 from xgboost import XGBClassifier
@@ -30,6 +33,7 @@ from src.preprocessing import (
     DEFAULT_RMS_WINDOW_MS,
     compute_rms_envelope,
     detect_activity_regions,
+    improved_get_segment_ranges,
     load_emg_data,
 )
 from src.utils import (
@@ -51,6 +55,14 @@ THRESHOLD_MULTIPLIER_MAX = 1.5
 SMALL_EPS = 1e-8
 TRAIN_DIR = "train"
 TEST_DIR = "test"
+
+AMP_COLORS = {"full": "#4caf50", "half": "#ffb300", "invalid": "#9e9e9e"}
+FATIGUE_COLORS = {
+    "free": "#64b5f6",
+    "light": "#ffd54f",
+    "medium": "#ffb74d",
+    "heavy": "#e57373",
+}
 
 
 def build_segment_dataset(segment_metadata):
@@ -122,14 +134,52 @@ def evaluate_ml_models(X, y, task_name):
     best = max(results, key=lambda k: results[k]["f1"])
     best_pred_labels = le.inverse_transform(results[best]["pred"])
 
+    # Use cross-validation to obtain full-dataset predictions for richer confusion matrices,
+    # and fit a full-data model separately for downstream inference.
+    unique_classes = np.unique(y_enc)
+    if len(unique_classes) == 1:
+        scaler_full = StandardScaler().fit(X)
+        best_model_full = clone(models[best])
+        best_model_full.fit(scaler_full.transform(X), y_enc)
+        results[best]["model_full"] = best_model_full
+        single_label = le.inverse_transform(unique_classes)[0]
+        return {
+            "best": best,
+            "results": results,
+            "label_encoder": le,
+            "scaler": scaler_full,
+            "full_model": best_model_full,
+            "y_test": y_test,
+            "y_test_labels": le.inverse_transform(y_test),
+            "best_pred_labels": best_pred_labels,
+            "cv_true_labels": y,
+            "cv_pred_labels": [single_label] * len(y),
+        }
+
+    min_class = int(np.min(np.bincount(y_enc)))
+    n_splits = max(2, min(5, min_class))
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    best_for_cv = clone(models[best])
+    cv_pipeline = make_pipeline(StandardScaler(), best_for_cv)
+    cv_pred = cross_val_predict(cv_pipeline, X, y_enc, cv=skf)
+    cv_pred_labels = le.inverse_transform(cv_pred)
+
+    scaler_full = StandardScaler().fit(X)
+    best_model_full = clone(models[best])
+    best_model_full.fit(scaler_full.transform(X), y_enc)
+    results[best]["model_full"] = best_model_full
+
     return {
         "best": best,
         "results": results,
         "label_encoder": le,
-        "scaler": scaler,
+        "scaler": scaler_full,
+        "full_model": best_model_full,
         "y_test": y_test,
         "y_test_labels": le.inverse_transform(y_test),
         "best_pred_labels": best_pred_labels,
+        "cv_true_labels": y,
+        "cv_pred_labels": cv_pred_labels,
     }
 
 
@@ -189,11 +239,21 @@ def segment_raw_signal(raw_signal, subject_id, subject_profiles, global_peak):
 
 def classify_segments(signal, segments, feature_names, amp_eval, fat_eval):
     """对分割出的片段做动作幅度与疲劳预测。"""
-    amp_model = amp_eval["results"][amp_eval["best"]]["model"]
+    amp_model = (
+        amp_eval.get("full_model")
+        or amp_eval["results"][amp_eval["best"]].get("model_full")
+        or amp_eval["results"][amp_eval["best"]]["model"]
+    )
     amp_scaler = amp_eval["scaler"]
     amp_le = amp_eval["label_encoder"]
 
-    fat_model = fat_eval["results"][fat_eval["best"]]["model"] if fat_eval else None
+    fat_model = None
+    if fat_eval:
+        fat_model = (
+            fat_eval.get("full_model")
+            or fat_eval["results"][fat_eval["best"]].get("model_full")
+            or fat_eval["results"][fat_eval["best"]]["model"]
+        )
     fat_scaler = fat_eval["scaler"] if fat_eval else None
     fat_le = fat_eval["label_encoder"] if fat_eval else None
 
@@ -220,23 +280,116 @@ def classify_segments(signal, segments, feature_names, amp_eval, fat_eval):
 
 
 def plot_labeled_segments(signal, segments, amp_labels, fat_labels, save_path):
-    """绘制带标签的分割结果。"""
+    """Plot labeled segments with amplitude/fatigue color bars."""
+    if len(signal) == 0:
+        print("Warning: empty signal, skip plotting labeled segments.")
+        return
+
     t = np.arange(len(signal)) / FS
-    plt.figure(figsize=(15, 6))
-    plt.plot(t, signal, lw=0.5, alpha=0.7, label="EMG")
+    fig, (ax_sig, ax_bar) = plt.subplots(
+        2,
+        1,
+        sharex=True,
+        gridspec_kw={"height_ratios": [3, 1]},
+        figsize=(15, 7),
+    )
+
+    ax_sig.plot(t, signal, lw=0.5, alpha=0.7, label="EMG")
+    max_val = np.max(np.abs(signal)) if np.max(np.abs(signal)) > 0 else 1.0
 
     for (start, end), amp, fat in zip(segments, amp_labels, fat_labels):
-        plt.axvspan(start / FS, end / FS, alpha=0.3, color="lightblue")
-        plt.text((start + end) / 2 / FS, np.max(signal) * 0.8, f"{amp}/{fat}", ha="center", fontsize=8)
+        color = AMP_COLORS.get(amp, "#90caf9")
+        ax_sig.axvspan(start / FS, end / FS, alpha=0.25, color=color)
+        ax_sig.text(
+            (start + end) / 2 / FS,
+            max_val * 0.8,
+            f"{amp}/{fat}",
+            ha="center",
+            fontsize=8,
+            color="black",
+        )
 
-    plt.xlabel("Time (s)")
-    plt.ylabel("Amplitude")
-    plt.title("Segmentation with Predictions")
-    plt.grid(True, alpha=0.3)
+    bar_height = 0.35
+    for (start, end), amp, fat in zip(segments, amp_labels, fat_labels):
+        start_t = start / FS
+        width = (end - start) / FS
+        ax_bar.broken_barh(
+            [(start_t, width)],
+            (0.1, bar_height),
+            facecolors=AMP_COLORS.get(amp, "#90caf9"),
+            edgecolors="none",
+        )
+        ax_bar.broken_barh(
+            [(start_t, width)],
+            (0.55, bar_height),
+            facecolors=FATIGUE_COLORS.get(fat, "#b0bec5"),
+            edgecolors="none",
+        )
+
+    ax_bar.set_ylim(0, 1.0)
+    ax_bar.set_yticks([0.1 + bar_height / 2, 0.55 + bar_height / 2])
+    ax_bar.set_yticklabels(["Amplitude", "Fatigue"])
+    ax_bar.set_xlabel("Time (s)")
+    ax_bar.set_title("Action Amplitude & Fatigue Bars")
+
+    used_amps = [k for k in AMP_COLORS if k in set(amp_labels)]
+    used_fats = [k for k in FATIGUE_COLORS if k in set(fat_labels)]
+    amp_patches = [mpatches.Patch(color=AMP_COLORS[k], label=f"amp: {k}") for k in used_amps]
+    fat_patches = [mpatches.Patch(color=FATIGUE_COLORS[k], label=f"fatigue: {k}") for k in used_fats]
+    legend_handles = amp_patches + fat_patches
+    if legend_handles:
+        ax_sig.legend(handles=legend_handles, loc="upper right", fontsize=8)
+
+    ax_sig.set_ylabel("Amplitude")
+    ax_sig.set_title("Segmentation with Predictions")
+    ax_sig.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(save_path, dpi=300)
-    plt.close()
-    print(f"分割可视化保存: {save_path}")
+    plt.close(fig)
+    print(f"Segmentation visualization saved: {save_path}")
+
+
+def plot_reference_segments(raw_signal, segment_ranges, segment_meta, save_path):
+    """Overlay manual segments on raw EMG for learning references."""
+    if len(raw_signal) == 0 or not segment_ranges:
+        print("Warning: no valid raw signal or manual ranges, skip reference plot.")
+        return
+
+    t = np.arange(len(raw_signal)) / FS
+    fig, ax = plt.subplots(figsize=(15, 5))
+
+    ax.plot(t, raw_signal, lw=0.5, alpha=0.6, label="Raw EMG")
+    env = compute_rms_envelope(raw_signal, int(RMS_WINDOW_MS * FS / 1000), FS)
+    env_norm = env / (np.max(env) + SMALL_EPS) * (np.max(np.abs(raw_signal)) * 0.6)
+    ax.plot(t, env_norm, color="#ef6c00", lw=1.2, alpha=0.8, label="RMS Envelope (scaled)")
+
+    for (start, end), meta in zip(segment_ranges, segment_meta):
+        amp = meta.get("amplitude", "manual")
+        fat = meta.get("fatigue", "")
+        color = AMP_COLORS.get(amp, "#90caf9")
+        ax.axvspan(start / FS, end / FS, color=color, alpha=0.25)
+        ax.text(
+            (start + end) / 2 / FS,
+            np.max(np.abs(raw_signal)) * 0.8,
+            f"{amp}/{fat}",
+            ha="center",
+            fontsize=7,
+            color="black",
+        )
+
+    used_amps = {m.get("amplitude") for m in segment_meta if m.get("amplitude") in AMP_COLORS}
+    amp_patches = [mpatches.Patch(color=AMP_COLORS[k], label=f"amp: {k}") for k in used_amps]
+    legend_handles = amp_patches + [mpatches.Patch(color="#ef6c00", label="RMS Envelope")]
+    ax.legend(handles=legend_handles, loc="upper right", fontsize=8)
+
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Amplitude")
+    ax.set_title("Manual Segments Overlay (Learning Reference)")
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close(fig)
+    print(f"Manual reference visualization saved: {save_path}")
 
 
 def main():
@@ -265,8 +418,8 @@ def main():
     print("\n=== 动作幅度分类（特征 + 多模型对比） ===")
     amp_eval = evaluate_ml_models(feature_matrix, amp_labels, "Amplitude")
     plot_confusion_matrix(
-        amp_eval["y_test_labels"],
-        amp_eval["best_pred_labels"],
+        amp_eval["cv_true_labels"],
+        amp_eval["cv_pred_labels"],
         list(amp_eval["label_encoder"].classes_),
         title="Amplitude Confusion Matrix",
         save_path="results/amplitude_confusion_matrix.png",
@@ -286,8 +439,8 @@ def main():
         fat_subset_labels = [fat_labels[i] for i in full_idx]
         fat_eval = evaluate_ml_models(fat_feature_matrix, fat_subset_labels, "Fatigue")
         plot_confusion_matrix(
-            fat_eval["y_test_labels"],
-            fat_eval["best_pred_labels"],
+            fat_eval["cv_true_labels"],
+            fat_eval["cv_pred_labels"],
             list(fat_eval["label_encoder"].classes_),
             title="Fatigue Confusion Matrix",
             save_path="results/fatigue_confusion_matrix.png",
@@ -314,6 +467,19 @@ def main():
         raw_signal = load_emg_data(raw_path)
         meta = parse_filename(os.path.basename(raw_path)) or {}
         subject_id = meta.get("subject_id")
+
+        if raw_path in train_files["segment_dirs"]:
+            seg_dir = train_files["segment_dirs"][raw_path]
+            manual_ranges = improved_get_segment_ranges(raw_path, seg_dir)
+            manual_meta = load_segments_metadata(seg_dir)
+            manual_meta_sorted = sorted(manual_meta, key=lambda m: m.get("path", ""))
+            paired_meta = manual_meta_sorted[: len(manual_ranges)]
+            if manual_ranges:
+                ref_save_path = os.path.join(
+                    "results",
+                    f"reference_manual_{os.path.basename(raw_path).replace('.csv', '.png')}",
+                )
+                plot_reference_segments(raw_signal, manual_ranges, paired_meta, ref_save_path)
 
         segments = segment_raw_signal(raw_signal, subject_id, subject_profiles, global_peak)
         amp_preds, fat_preds = classify_segments(raw_signal, segments, feature_names, amp_eval, fat_eval)

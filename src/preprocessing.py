@@ -782,22 +782,26 @@ def learn_segment_basis_and_detect(raw_signal, segment_signals, fs=DEFAULT_SAMPL
     X = []
     y = []
     
+    pos_count = 0
     for seg in segment_signals:
         seg = np.asarray(seg, dtype=float)
         for start in range(0, len(seg) - window_size + 1, step_size):
             win = seg[start:start + window_size]
             X.append(_basic_window_features(win))
             y.append(1)
+            pos_count += 1
     
     # Negative samples from raw signal (random windows)
     raw = np.asarray(raw_signal, dtype=float)
     if len(raw) >= window_size:
-        for start in range(0, len(raw) - window_size + 1, window_size):
+        for start in range(0, len(raw) - window_size + 1, step_size):
             win = raw[start:start + window_size]
             X.append(_basic_window_features(win))
             y.append(0)
+    neg_count = len(X) - pos_count
     
-    if len(X) < 4:
+    # Require at least a couple of positive/negative windows to train a classifier
+    if pos_count < 2 or neg_count < 2:
         return []
     
     clf = RandomForestClassifier(n_estimators=50, random_state=42)

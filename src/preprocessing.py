@@ -106,17 +106,24 @@ def notch_filter(data, freq=50, fs=2000, quality=30):
     return filtered_data
 
 
-def preprocess_signal(data, fs=2000):
+def preprocess_signal(data, fs=2000, apply_filter=False):
     """
-    Apply full preprocessing pipeline to EMG signal.
+    Apply preprocessing to EMG signal.
+    
+    Filtering is optional; by default, the raw signal is returned to
+    respect workflows that avoid pre-filtering.
     
     Args:
         data: array-like, raw EMG signal
         fs: int, sampling rate in Hz
+        apply_filter: bool, whether to run bandpass + notch filtering
     
     Returns:
         np.array: preprocessed signal
     """
+    if not apply_filter:
+        return np.asarray(data, dtype=float)
+    
     # Apply bandpass filter
     data_bp = bandpass_filter(data, lowcut=20, highcut=450, fs=fs)
     

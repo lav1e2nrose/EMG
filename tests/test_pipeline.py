@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import sys
 import os
+import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../src'))
 
@@ -371,6 +372,25 @@ class TestUtils(unittest.TestCase):
         
         for metadata in invalid_cases:
             self.assertFalse(validate_labels(metadata))
+
+
+class TestVisualization(unittest.TestCase):
+    """Test visualization helpers."""
+
+    def test_plot_labeled_segments_saves_file(self):
+        from main import plot_labeled_segments  # main only defines functions, no side effects
+
+        signal = np.sin(np.linspace(0, 2 * np.pi, 400))
+        segments = [(50, 150), (200, 300)]
+        amp_labels = ["full", "half"]
+        fat_labels = ["free", "light"]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_path = os.path.join(tmp_dir, "seg.png")
+            plot_labeled_segments(signal, segments, amp_labels, fat_labels, save_path)
+
+            self.assertTrue(os.path.exists(save_path))
+            self.assertGreater(os.path.getsize(save_path), 0)
 
 
 class TestCRNN(unittest.TestCase):

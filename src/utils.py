@@ -115,7 +115,6 @@ def plot_confusion_matrix(y_true, y_pred, labels, title='Confusion Matrix',
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"Confusion matrix saved to {save_path}")
     
-    plt.show()
     plt.close()
 
 
@@ -152,7 +151,6 @@ def plot_signal_with_segments(signal, segment_indices, sampling_rate=2000,
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"Signal plot saved to {save_path}")
     
-    plt.show()
     plt.close()
 
 
